@@ -271,36 +271,47 @@ Numato_device = init_serial_port(Relay_port, Relay_baudrate, Relay_timeout)
 
 def segment_droplet_fl(
     raw_fl: np.ndarray,
-    n_components: int = 2,
-    bridge_kernel_size: tuple = (15, 20),
-    min_component_area: int = 500,
+    min_component_area: int = 10,
+    max_electrode_gap: int = 100,
 ) -> tuple:
     """
     Segment a droplet from a raw uint16 fluorescence image.
 
-    The electrode splits the droplet into two bright regions separated by a
-    dark band.  We bridge that gap with a wide vertical dilation, then erode
-    back to restore the original edges, avoiding the corner-clipping that
-    a convex hull causes on concave droplets.
+    The electrode(s) create dark bands that split the droplet into multiple
+    bright fluorescent regions.  Because the electrode bands are identical
+    in intensity to the background, thresholding alone cannot fill them.
+    Instead we use the spatial relationship between bright regions:
+
+      1. Otsu-threshold and collect all components above min_component_area.
+      2. Sort components top-to-bottom.  Starting from the largest component,
+         greedily keep any component whose top edge is within max_electrode_gap
+         pixels of the running bottom edge.  This chains through multiple
+         electrode gaps while rejecting distant noise specks.
+      3. Compute the convex hull over ALL bright pixels from the kept
+         components.  This correctly fills the dark electrode bands and
+         reconstructs the full droplet shape regardless of how many electrodes
+         there are or how much the halves are horizontally offset.
+      4. Light morphological closing to smooth the boundary.
 
     Parameters
     ----------
     raw_fl : np.ndarray uint16
         Raw fluorescence image returned by snap_EPI_image().
-    n_components : int
-        Number of largest threshold components to keep before bridging.
-        2 works for one electrode band; increase if there are more bands.
-    bridge_kernel_size : (width, height)
-        Structuring element for the vertical dilation bridge.
-        Width 15 gives generous horizontal reach; height 20 bridges gaps
-        up to ~20 px tall.
     min_component_area : int
-        Components smaller than this (px²) are discarded as noise.
+        Components smaller than this (px²) are discarded before the
+        proximity check.  Very low (default 10) so the small bottom piece
+        of the droplet is never accidentally discarded; the proximity
+        check handles noise rejection instead.
+    max_electrode_gap : int
+        Maximum gap in pixels between the bottom of the last kept
+        component and the top of the next candidate.  Electrode bands
+        are typically 25-35 px; 50 gives comfortable headroom while
+        safely rejecting noise specks that are further away.
 
     Returns
     -------
     mask : np.ndarray bool
-        Final cleaned binary mask.
+        Final cleaned binary mask of the full droplet.
     area_px : int
         Number of True pixels in the mask.
     overlay_bgr : np.ndarray uint8
@@ -314,7 +325,7 @@ def segment_droplet_fl(
     # 2. Otsu threshold – adapts automatically to varying FL intensity
     _, binary = cv2.threshold(norm, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # 3. Keep the N largest components above the noise floor
+    # 3. Collect all components above the noise floor
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
     component_areas = [
         (stats[i, cv2.CC_STAT_AREA], i)
@@ -323,45 +334,45 @@ def segment_droplet_fl(
     ]
     component_areas.sort(reverse=True)
 
-    top_n = np.zeros_like(binary)
-    for _, i in component_areas[:n_components]:
-        top_n[labels == i] = 1
-
-    # 4. Wide vertical dilation to bridge the electrode gap
-    kernel_vert = cv2.getStructuringElement(cv2.MORPH_RECT, bridge_kernel_size)
-    bridged = cv2.dilate(top_n, kernel_vert)
-
-    # 5. Find the now-single connected region
-    n_b, labels_b, stats_b, _ = cv2.connectedComponentsWithStats(bridged, 8)
-    if n_b < 2:
-        # fallback – return empty mask if bridging failed
+    if not component_areas:
+        # No components found – return empty mask
         return np.zeros_like(binary, dtype=bool), 0, cv2.cvtColor(norm, cv2.COLOR_GRAY2BGR)
 
-    areas_b = [(stats_b[i, cv2.CC_STAT_AREA], i) for i in range(1, n_b)]
-    areas_b.sort(reverse=True)
-    biggest_bridged = (labels_b == areas_b[0][1]).astype(np.uint8)
+    # 4. Greedily keep components within max_electrode_gap of the running
+    #    bottom edge, chaining through multiple electrode bands.
+    #    Seed with the largest component (main droplet body), then re-sort
+    #    remaining candidates top-to-bottom so the running bottom advances
+    #    correctly through each consecutive electrode gap.
+    kept = [component_areas[0]]
+    current_bottom = int(np.where(labels == component_areas[0][1])[0].max())
 
-    # 6. Erode back to restore original droplet edges
-    eroded = cv2.erode(biggest_bridged, kernel_vert)
+    remaining = sorted(component_areas[1:],
+                       key=lambda t: np.where(labels == t[1])[0].min())
+    for area, i in remaining:
+        ys = np.where(labels == i)[0]
+        if int(ys.min()) - current_bottom <= max_electrode_gap:
+            kept.append((area, i))
+            current_bottom = max(current_bottom, int(ys.max()))
 
-    # 7. Union with original mask to recover any pixels lost in the erode
-    combined = np.clip(eroded + top_n, 0, 1).astype(np.uint8)
+    # 5. Convex hull over all bright pixels from kept components.
+    #    Wrapping the combined point cloud in a convex hull fills the dark
+    #    electrode bands and any horizontal offset between halves in one step.
+    all_bright = np.zeros_like(binary)
+    for _, i in kept:
+        all_bright = np.clip(all_bright + (labels == i).astype(np.uint8), 0, 1)
 
-    # 8. Fill internal holes via external contour fill
-    contours, _ = cv2.findContours(
-        combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    filled = np.zeros_like(combined)
-    if contours:
-        cv2.drawContours(filled, contours, -1, 1, -1)
+    pts = np.column_stack(np.where(all_bright))[:, ::-1].astype(np.int32)  # (x, y)
+    hull = cv2.convexHull(pts)
+    hull_mask = np.zeros_like(binary)
+    cv2.fillPoly(hull_mask, [hull], 1)
 
-    # 9. Light closing to smooth the boundary
-    kernel_smooth = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    final = cv2.morphologyEx(filled, cv2.MORPH_CLOSE, kernel_smooth).astype(bool)
+    # 6. Light closing to smooth the boundary
+    kernel_s = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    final = cv2.morphologyEx(hull_mask, cv2.MORPH_CLOSE, kernel_s).astype(bool)
 
     area_px = int(final.sum())
 
-    # 10. BGR overlay for saving as a visual check
+    # 7. BGR overlay for saving as a visual check
     bgr = cv2.cvtColor(norm, cv2.COLOR_GRAY2BGR)
     overlay = bgr.copy()
     overlay[final] = (
@@ -924,7 +935,7 @@ class DropletWorker(QThread):
         self.control_valve(input_1 + 11, state=True)
         self.control_valve(input_2 + 11, state=True)
         self.control_valve(7, state=True)
-        time.sleep(20)
+        time.sleep(10)
 
     def generate_droplet(self, input_1, input_2):
         self.control_valve(2, state=True);  self.control_valve(5, state=True)
@@ -937,9 +948,9 @@ class DropletWorker(QThread):
     def drive_droplet(self, Chemostat_number):
         self.control_valve(2, state=False); self.control_valve(5, state=False)
         self.control_valve(Chemostat_number + 7, state=True)
-        send_to_arduino(2)
+        send_to_arduino(5)
         time.sleep(self.Drive_duration)
-        send_to_arduino(3)
+        send_to_arduino(4)
         self.control_valve(Chemostat_number + 7, state=False)
         self.control_valve(4, state=False)
         time.sleep(3)
@@ -1011,7 +1022,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.mmc.setProperty(self.camera, 'CONVERSION FACTOR COEFF', 0.5)
         self.mmc.setProperty(self.camera, 'PixelType', '16bit')
         self.mmc.setProperty(self.DIAlamp, 'ComputerControl', 'On')
-        self.mmc.setProperty(self.DIAlamp, 'Intensity', 4)
+        self.mmc.setProperty(self.DIAlamp, 'Intensity', 3)
         self.mmc.setProperty(self.DIAlamp, 'State', 0)
         self.mmc.setProperty(self.DIAshutter, 'State', 0)
         self.mmc.setProperty(self.EPIshutter,  'State', 0)
@@ -1858,13 +1869,11 @@ class MicroscopeControlGUI(QMainWindow):
         # Initialise valves
         init_states = [
             (0, False), (1, True),  (2, False), (3, True),  (4, True),  (5, False),
-            (6, False), (7, True),  (8, False), (9, False), (10, False), (11, False),
+            (6, True), (7, True),  (8, False), (9, False), (10, False), (11, False),
             (12, True), (13, True), (14, True), (15, True),
         ]
         for v, s in init_states:
             self.control_valve(v, state=s)
-
-        self.mmc.setTimeoutMs(30000)
 
         experiment_start = time.time()
         tick_number      = 0
@@ -1918,11 +1927,13 @@ class MicroscopeControlGUI(QMainWindow):
                     f"Area check – Pos {pos_num}  Loop {pos_loop}  "
                     f"filt {seg_filt}  {seg_exp}ms  @ {time_tag_str}"
                 )
+                self.mmc.setTimeoutMs(30000)
                 self.mmc.setXYPosition(px, py)
                 self.mmc.waitForDevice(self.mmc.getXYStageDevice())
                 self.mmc.setPosition(pz)
                 self.mmc.waitForDevice(self.mmc.getFocusDevice())
-                time.sleep(0.3)
+                self.mmc.setTimeoutMs(5000)
+                time.sleep(0.1)
 
                 raw_fl = self.snap_EPI_image(seg_filt, seg_exp)
 
@@ -1979,6 +1990,14 @@ class MicroscopeControlGUI(QMainWindow):
             # Only runs when at least one position was triggered this tick.
             # Row 0 was already imaged in Phase 1, so we start from row 1.
             if len(self.selected_exposures) > 1:
+                # Reset shutter state after chemostat protocol before imaging.
+                # The chemostat sequence leaves the hardware in an uncertain
+                # shutter state; explicitly closing both shutters and waiting
+                # prevents waitForSystem() timing out on TIEpiShutter.
+                self.mmc.setProperty(self.EPIshutter, 'State', 0)
+                self.mmc.setProperty(self.DIAshutter, 'State', 0)
+                self.mmc.waitForSystem()
+                time.sleep(1.0)
                 self._fl_status("Full exposure table imaging of all positions …")
                 for idx, (px, py, pz) in enumerate(self.positions):
                     pos_num  = idx + 1
@@ -1987,10 +2006,12 @@ class MicroscopeControlGUI(QMainWindow):
                     fl_dir = os.path.join(base, f"Position_{pos_num}", "FL")
                     os.makedirs(fl_dir, exist_ok=True)
 
+                    self.mmc.setTimeoutMs(30000)
                     self.mmc.setXYPosition(px, py)
                     self.mmc.waitForDevice(self.mmc.getXYStageDevice())
                     self.mmc.setPosition(pz)
                     self.mmc.waitForDevice(self.mmc.getFocusDevice())
+                    self.mmc.setTimeoutMs(5000)
                     time.sleep(0.3)
 
                     for filt, exp in self.selected_exposures[1:]:
@@ -2011,7 +2032,7 @@ class MicroscopeControlGUI(QMainWindow):
             # ── chemostat protocol for triggered positions only ────────────
             if self.Chemostat_protocol_steps:
                 self._fl_status("Running chemostat for triggered positions …")
-
+                
                 self.control_valve(15, state=False)
                 time.sleep(10)
                 self.control_valve(15, state=True)
@@ -2029,6 +2050,12 @@ class MicroscopeControlGUI(QMainWindow):
                 self.video_thread = VideoThread()
                 self.video_thread.start()
                 QtCore.QThread.msleep(300)
+                
+                
+                # ── HOLD DROPLETS IN PLACE ────────────
+                send_to_arduino(2)
+                send_to_arduino(4)
+                self.control_valve(6, state=False)
 
                 for step in self.Chemostat_protocol_steps:
                     i1    = step["input1"]
@@ -2041,10 +2068,12 @@ class MicroscopeControlGUI(QMainWindow):
                     for rn, active in enumerate(rings):
                         if active and (rn in triggered_positions):
                             px, py, pz = self.positions[rn]
+                            self.mmc.setTimeoutMs(30000)
                             self.mmc.setXYPosition(px, py)
                             self.mmc.waitForDevice(self.mmc.getXYStageDevice())
                             self.mmc.setPosition(pz)
                             self.mmc.waitForDevice(self.mmc.getFocusDevice())
+                            self.mmc.setTimeoutMs(5000)
                             time.sleep(0.3)
 
                             gw = DropletWorker("generate", i1, flow_duration=flow_dur)
@@ -2078,6 +2107,12 @@ class MicroscopeControlGUI(QMainWindow):
                 self.video_thread = None
                 self.mmc.setProperty(self.DIAlamp, "State", 0)
 
+                self.control_valve(6, state=True)
+                send_to_arduino(4)
+                send_to_arduino(3)
+                
+
+
             # ── increment loop counters for triggered positions ───────────
             for idx in triggered_positions:
                 pos_loop_count[idx] = pos_loop_count.get(idx, 0) + 1
@@ -2087,6 +2122,7 @@ class MicroscopeControlGUI(QMainWindow):
 
         # ── experiment complete ───────────────────────────────────────────
         self.mmc.setTimeoutMs(5000)
+        send_to_arduino(3)
         self.control_valve(0, state=True)
         print("\n=== FL-segmentation timelapse complete ===")
         self._fl_status("Experiment complete.")
