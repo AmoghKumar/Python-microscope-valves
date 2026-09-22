@@ -1014,6 +1014,7 @@ class DropletWorker(QThread):
     def __init__(self, operation, input_1=None, input_2=None,
                  inlets=None,
                  purge_duration=0, flow_duration=0, drive_duration=0,
+                 shrink_duration=0,
                  chemostat_number=4, PWM_duration1=0.05, PWM_duration2=0.05,
                  PWM_totalduration=5):
         super().__init__()
@@ -1026,6 +1027,7 @@ class DropletWorker(QThread):
         self.Purge_duration    = purge_duration
         self.Flow_duration     = flow_duration
         self.Drive_duration    = drive_duration
+        self.Shrink_duration   = shrink_duration
         self.PWM_duration1     = PWM_duration1
         self.PWM_duration2     = PWM_duration2
         self.PWM_totalduration = PWM_totalduration
@@ -1035,9 +1037,10 @@ class DropletWorker(QThread):
             "purge":        lambda: self.purge_inlet(*self.inlets),
             "generate": lambda: self.generate_droplet(*self.inlets),
             "drive":      lambda: self.drive_droplet(self.chemostat),
+            "shrink":     lambda: self.shrink_droplet(self.chemostat),
             "characterize": lambda: self.characterize_droplet(*self.inlets, self.chemostat),
             "wash":       lambda: self.wash_step(self.input_1, self.input_2),
-        
+
         }
 
         ops.get(self.operation, lambda: print("Invalid operation"))()
@@ -1267,6 +1270,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.current_protocol_table_step = 0
         self._experiment_stop_requested = False
         self._exp_worker = None
+        self.shrink_auto_mode = False   # Manual is the default mode
         self._init_microscope()
         self._build_ui()
         self.setWindowTitle('Microscope Control')
@@ -1598,9 +1602,10 @@ class MicroscopeControlGUI(QMainWindow):
         # -- Droplet parameters
         dp_grid = QGridLayout()
         dp_grid.setSpacing(4)
-        self.purge_duration_Input  = QLineEdit("0")
-        self.flow_duration_Input   = QLineEdit("0")
-        self.drive_duration_Input  = QLineEdit("0")
+        self.Shrink_duration_Input = QLineEdit("5")
+        self.purge_duration_Input  = QLineEdit("1")
+        self.flow_duration_Input   = QLineEdit("0.1")
+        self.drive_duration_Input  = QLineEdit("5")
         self.inlet_Input           = QLineEdit("1")
         self.inlet1_Input          = QSpinBox()
         self.inlet1_Input.setRange(1, 9)
@@ -1608,12 +1613,31 @@ class MicroscopeControlGUI(QMainWindow):
         self.inlet2_Input          = QSpinBox()
         self.inlet2_Input.setRange(1, 9)
         self.inlet2_Input.setValue(2)
+
+        # -- Shrink duration + Auto/Manual mode + target ratio, all one row
+        shrink_lbl = QLabel("Shrink duration (s):"); shrink_lbl.setStyleSheet("color:#aaa;")
+        self.shrink_mode_button = QPushButton("Mode: Manual")
+        self.shrink_mode_button.setCheckable(True)
+        self.shrink_mode_button.setChecked(False)   # Manual is the default mode
+        self.shrink_mode_button.setStyleSheet(BTN_RED)
+        self.shrink_mode_button.clicked.connect(self._on_toggle_shrink_mode)
+        target_lbl = QLabel("Shrink target (x initial):"); target_lbl.setStyleSheet("color:#aaa;")
+        self.shrink_target_ratio_Input = QLineEdit("0.85")
+        shrink_row = QHBoxLayout()
+        shrink_row.setSpacing(6)
+        shrink_row.addWidget(shrink_lbl)
+        shrink_row.addWidget(self.Shrink_duration_Input)
+        shrink_row.addWidget(self.shrink_mode_button)
+        shrink_row.addWidget(target_lbl)
+        shrink_row.addWidget(self.shrink_target_ratio_Input)
+        dp_grid.addLayout(shrink_row, 0, 0, 1, 2)
+
         for row, (lbl, widget) in enumerate([
             ("Purge duration (s):",       self.purge_duration_Input),
             ("Aqueous flow duration (s):", self.flow_duration_Input),
             ("Drive duration (s):",        self.drive_duration_Input),
             ("Chemostat number:",          self.inlet_Input),
-        ]):
+        ], start=1):
             l = QLabel(lbl); l.setStyleSheet("color:#aaa;")
             dp_grid.addWidget(l, row, 0)
             dp_grid.addWidget(widget, row, 1)
@@ -1638,7 +1662,7 @@ class MicroscopeControlGUI(QMainWindow):
         inlet_row.addLayout(inlet1_box, 1)
         inlet_row.addLayout(inlet2_box, 1)
         inlet_row.addWidget(self.Generate_drop_button, 1)
-        dp_grid.addLayout(inlet_row, 4, 0, 1, 2)
+        dp_grid.addLayout(inlet_row, 5, 0, 1, 2)
         right.addWidget(group("Droplet Parameters", dp_grid))
 
         # -- Voltage
@@ -2369,6 +2393,139 @@ class MicroscopeControlGUI(QMainWindow):
             remaining -= chunk
         if self._experiment_stop_requested:
             raise ExperimentStopped()
+
+    def _on_toggle_shrink_mode(self):
+        """Shrink mode toggle button - Manual (default) uses a single fixed
+        Shrink_duration pass; Auto adaptively re-measures droplet area and
+        keeps shrinking until it's below the target ratio of its initial
+        area (see _run_auto_shrink)."""
+        self.shrink_auto_mode = self.shrink_mode_button.isChecked()
+        if self.shrink_auto_mode:
+            self.shrink_mode_button.setText("Mode: Auto")
+            self.shrink_mode_button.setStyleSheet(BTN_GREEN)
+        else:
+            self.shrink_mode_button.setText("Mode: Manual")
+            self.shrink_mode_button.setStyleSheet(BTN_RED)
+
+    def _measure_chemostat_droplet_area(self, chem_num, positions_table, filt, exp, save_tag=None):
+        """
+        Move to the stage position for chemostat chem_num, snap an FL
+        image with the given filter/exposure, and return its droplet area
+        in px via segment_droplet_fl - the same segmentation used for FL
+        timelapse area-check imaging. Chemostat N sits at positions_table[N-1],
+        the same mapping drive_droplet's caller already relies on.
+
+        If save_tag is given, also saves the segmentation overlay (mask +
+        contour) as "Mask_chemostat<chem_num>_<save_tag>.png" in the
+        current directory, e.g. save_tag="initial" or "cycle2".
+        """
+        px, py, pz = positions_table[chem_num - 1]
+        self.mmc.setTimeoutMs(30000)
+        self.mmc.setXYPosition(px, py)
+        self.mmc.waitForDevice(self.mmc.getXYStageDevice())
+        self.mmc.setPosition(pz)
+        self.mmc.waitForDevice(self.mmc.getFocusDevice())
+        self.mmc.setTimeoutMs(5000)
+        time.sleep(0.3)
+        raw_fl = self.snap_EPI_image(filt, exp)
+        _, area, overlay = segment_droplet_fl(raw_fl)
+        if save_tag is not None:
+            mask_fname = f"Mask_chemostat{chem_num}_{save_tag}.png"
+            cv2.imwrite(os.path.join(".", mask_fname), overlay)
+        return area
+
+    def _run_auto_shrink(self, used_chemostats, positions_table, selected_exposures,
+                          shrink_duration, shrink_initial_areas):
+        """
+        Adaptively shrink every chemostat in used_chemostats until its
+        droplet area is below shrink_target_ratio_Input x its initial area
+        (measured once per chemostat and cached in shrink_initial_areas,
+        which the caller keeps across loops of the whole experiment).
+
+        Each round: shrink every still-oversized chemostat once (highest
+        chemostat number first, one DropletWorker at a time), then
+        re-measure. The duration for a chemostat's next round is derived
+        from how much the previous round actually shrank it: if it went
+        from ratio `prev` to `ratio` in `used_dur` seconds, the shrink rate
+        is (prev-ratio)/used_dur, so closing the remaining (ratio-target)
+        gap takes roughly (ratio-target)/rate seconds. Capped at
+        MAX_ROUNDS; a chemostat still oversized after that is logged and
+        left as-is so the experiment can proceed. Duration is never let
+        drop below MIN_SHRINK_DURATION.
+        """
+        MAX_ROUNDS = 4
+        MIN_SHRINK_DURATION = 0.5
+
+        target_ratio = float(self.shrink_target_ratio_Input.text())
+        if not selected_exposures:
+            print("  WARNING: Auto shrink needs at least one row in the exposure "
+                  "table to measure droplet area - falling back to a single "
+                  "fixed-duration shrink pass for all chemostats.")
+            for chem_num in sorted(used_chemostats, reverse=True):
+                if self._experiment_stop_requested:
+                    raise ExperimentStopped()
+                sw = DropletWorker("shrink", chemostat_number=chem_num,
+                                    shrink_duration=shrink_duration)
+                sw.start(); sw.wait()
+            return
+        filt, exp = selected_exposures[0]
+
+        for chem_num in used_chemostats:
+            if self._experiment_stop_requested:
+                raise ExperimentStopped()
+            if chem_num not in shrink_initial_areas:
+                area = self._measure_chemostat_droplet_area(
+                    chem_num, positions_table, filt, exp, save_tag="initial")
+                shrink_initial_areas[chem_num] = area
+                print(f"  Chemostat {chem_num}: initial area recorded = {area} px")
+
+        pending    = set(used_chemostats)
+        durations  = {c: shrink_duration for c in used_chemostats}
+        prev_ratio = {c: 1.0 for c in used_chemostats}
+
+        round_num = 0
+        while pending and round_num < MAX_ROUNDS:
+            round_num += 1
+            for chem_num in sorted(pending, reverse=True):
+                if self._experiment_stop_requested:
+                    raise ExperimentStopped()
+                dur = max(MIN_SHRINK_DURATION, durations[chem_num])
+                durations[chem_num] = dur
+                sw = DropletWorker("shrink", chemostat_number=chem_num, shrink_duration=dur)
+                sw.start(); sw.wait()
+
+            still_pending = set()
+            for chem_num in sorted(pending, reverse=True):
+                if self._experiment_stop_requested:
+                    raise ExperimentStopped()
+                initial = shrink_initial_areas[chem_num]
+                area    = self._measure_chemostat_droplet_area(
+                    chem_num, positions_table, filt, exp, save_tag=f"cycle{round_num}")
+                ratio   = area / initial if initial > 0 else 1.0
+                print(f"  Chemostat {chem_num} shrink round {round_num}: "
+                      f"ratio={ratio:.3f} (target {target_ratio})")
+                if ratio <= target_ratio:
+                    print(f"  Chemostat {chem_num}: reached target after {round_num} round(s).")
+                    continue
+
+                drop    = prev_ratio[chem_num] - ratio
+                used_dur = durations[chem_num]
+                if drop > 1e-6:
+                    rate    = drop / used_dur
+                    next_dur = (ratio - target_ratio) / rate
+                else:
+                    # No measurable progress this round - try a longer pass
+                    # rather than repeating a duration that didn't work.
+                    next_dur = used_dur * 1.5
+                durations[chem_num]  = max(MIN_SHRINK_DURATION, next_dur)
+                prev_ratio[chem_num] = ratio
+                still_pending.add(chem_num)
+            pending = still_pending
+
+        if pending:
+            print(f"  WARNING: chemostat(s) {sorted(pending, reverse=True)} did not "
+                  f"reach target ratio {target_ratio} after {MAX_ROUNDS} round(s) - "
+                  f"proceeding with the rest of the experiment anyway.")
 
     def _fl_status(self, msg: str):
         """Update the FL segmentation status label and print to console."""
@@ -3323,9 +3480,15 @@ class MicroscopeControlGUI(QMainWindow):
         for v, s in init_states:
             self.control_valve(v, state=s)
 
-        purge_duration = float(self.purge_duration_Input.text())
-        flow_duration  = float(self.flow_duration_Input.text())
-        drive_duration = float(self.drive_duration_Input.text())
+        purge_duration  = float(self.purge_duration_Input.text())
+        flow_duration   = float(self.flow_duration_Input.text())
+        drive_duration  = float(self.drive_duration_Input.text())
+        shrink_duration = float(self.Shrink_duration_Input.text())
+
+        # Auto-shrink's per-chemostat initial-area baseline is measured once
+        # and reused for the whole experiment (not re-measured every loop),
+        # so this dict lives outside the loop below.
+        shrink_initial_areas = {}
 
         for loop in range(num_loops):
             print(f"--- Loop {loop+1}/{num_loops} ---")
@@ -3345,6 +3508,30 @@ class MicroscopeControlGUI(QMainWindow):
                 self.open_inlet(self.Buffer_inlet)
                 time.sleep(2)
                 self.close_inlet(self.Buffer_inlet)
+
+                # Shrink every chemostat used anywhere in the protocol
+                # table, highest chemostat number first, one worker at a
+                # time (wait for each to finish before starting the next).
+                used_chemostats = set()
+                for step in self.Chemostat_protocol_steps:
+                    for rn, active in enumerate(step["rings"]):
+                        if active:
+                            used_chemostats.add(rn + 1)
+
+                if self.shrink_auto_mode:
+                    self._run_auto_shrink(
+                        used_chemostats, positions_table, selected_exposures,
+                        shrink_duration, shrink_initial_areas)
+                else:
+                    for chem_num in sorted(used_chemostats, reverse=True):
+                        if self._experiment_stop_requested:
+                            raise ExperimentStopped()
+                        sw = DropletWorker(
+                            "shrink", chemostat_number=chem_num,
+                            shrink_duration=shrink_duration,
+                        )
+                        sw.start(); sw.wait()
+
                 self.mmc.setProperty(self.DIAlamp, "State", 1)
                 if self.video_thread is not None and self.video_thread.isRunning():
                     self.video_thread.stop()
@@ -3428,10 +3615,16 @@ class MicroscopeControlGUI(QMainWindow):
                 total_min=int(self.cycle_Input.text()),
             )
         else:
+            time_interval = int(self.cycle_Interval_Input.text())
+            total_duration = int(self.cycle_Input.text())
+            # "Total duration (min)" is the actual experiment length, not a
+            # loop count - the number of loops is however many cycle
+            # intervals fit into it.
+            num_loops = max(1, round(total_duration / time_interval)) if time_interval > 0 else 1
             self._launch_experiment_worker(
                 self.TimeLapse_Experiment,
-                num_loops=int(self.cycle_Input.text()),
-                time_interval=int(self.cycle_Interval_Input.text()),
+                num_loops=num_loops,
+                time_interval=time_interval,
                 # Snapshot into fresh lists rather than sharing the live
                 # attributes directly - the user can still click
                 # Save/Clear Position or Add Step while this worker thread
