@@ -1,12 +1,13 @@
 import os
 import time
+import traceback
 from pymmcore_plus import CMMCorePlus
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QScrollArea, QTabWidget, QFileDialog,
     QRadioButton, QFrame, QSpinBox, QLineEdit, QCheckBox, QPushButton,
     QLabel, QHBoxLayout, QVBoxLayout, QComboBox, QWidget, QTableWidget,
     QTableWidgetItem, QMessageBox, QInputDialog, QGridLayout, QSizePolicy,
-    QGroupBox, QSplitter
+    QGroupBox, QSplitter, QPlainTextEdit
 )
 from PyQt5.QtGui import QPixmap, QImage, QFont
 from PyQt5.QtCore import QTimer, pyqtSignal, pyqtSlot, Qt, QThread, QSize
@@ -65,6 +66,16 @@ QGroupBox::title {
     subcontrol-origin: margin;
     left: 8px;
     padding: 0 4px;
+}
+"""
+
+CONSOLE_LOG_STYLE = """
+QPlainTextEdit {
+    background-color: #0c0c0c;
+    color: #3ddc3d;
+    font-family: Consolas, monospace;
+    font-size: 11px;
+    border: 1px solid #333333;
 }
 """
 
@@ -770,6 +781,61 @@ Microscope['mmc'].loadSystemConfiguration("C:\\MATLAB Microscope\\AmoghMMConfig_
 
 
 # ─────────────────────────────────────────────
+#  Console log (mirrors print() into the UI)
+# ─────────────────────────────────────────────
+class _LogEmitter(QtCore.QObject):
+    message = pyqtSignal(str)
+
+
+class _StreamToLog:
+    """
+    Drop-in replacement for sys.stdout/sys.stderr: forwards every write to
+    the real stream (so the console/.bat window still shows it) and also
+    emits it as a Qt signal so it can be mirrored into the on-screen log
+    widgets. Qt auto-queues signal delivery across threads, so this is safe
+    to write to from worker QThreads (DropletWorker, VideoThread) as well
+    as the main thread.
+    """
+    def __init__(self, emitter, real_stream):
+        self.emitter     = emitter
+        self.real_stream = real_stream
+
+    def write(self, text):
+        if self.real_stream:
+            self.real_stream.write(text)
+        if text:
+            self.emitter.message.emit(text)
+
+    def flush(self):
+        if self.real_stream:
+            self.real_stream.flush()
+
+
+class ExperimentStopped(Exception):
+    """Raised inside an experiment run body when the user clicks Stop, so
+    the worker's except/finally can tell a clean user-stop apart from a
+    real error."""
+
+
+class _ExperimentBridge(QtCore.QObject):
+    """
+    GUI-update signals for the handful of widget writes that happen inside
+    code also called from a background experiment thread (control_valve,
+    all_on_callback, _fl_status, _sam2_status, the live_Button reset in
+    _stop_live_video). Qt's AutoConnection delivers these synchronously
+    when emitter and receiver share a thread (i.e. zero behavior change
+    for existing GUI-thread callers like valve-grid button clicks) and
+    auto-queues delivery onto the GUI thread otherwise - so the same
+    emit-then-slot code path is safe regardless of which thread calls it.
+    """
+    valve_style_changed = pyqtSignal(int, bool)   # idx, state
+    all_valves_reset     = pyqtSignal(bool)        # state applied to every valve
+    status_text_changed = pyqtSignal(str, str)    # which label ("fl"/"sam2"), text
+    live_button_reset   = pyqtSignal()
+    error_dialog        = pyqtSignal(str, str)    # title, message
+
+
+# ─────────────────────────────────────────────
 #  Custom toggle button
 # ─────────────────────────────────────────────
 class QToggleButton(QPushButton):
@@ -786,6 +852,13 @@ class QToggleButton(QPushButton):
 class VideoThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
 
+    # Live view runs at a fixed rate, independent of whatever exposure is
+    # configured for fluorescent snaps elsewhere in the UI. Exposure must be
+    # comfortably under the frame interval to leave headroom for readout.
+    LIVE_TARGET_FPS  = 100
+    LIVE_EXPOSURE_MS = 8
+    LIVE_INTERVAL_MS = 1000.0 / LIVE_TARGET_FPS   # 10 ms
+
     def __init__(self):
         super().__init__()
         self._run_flag    = True
@@ -795,7 +868,7 @@ class VideoThread(QThread):
         self.video_directory = "C:/Users/Cell Culture Scope/Downloads/Videos"
         self.video_filename  = self.get_unique_filename(self.video_directory)
         self.fourcc      = cv2.VideoWriter_fourcc(*'MJPG')
-        self.fps         = 10
+        self.fps         = self.LIVE_TARGET_FPS
         self.frame_size  = None
         self.mmc         = Microscope['mmc']
         self.camera      = self.mmc.getCameraDevice()
@@ -817,14 +890,21 @@ class VideoThread(QThread):
     def run(self):
         self.mmc.setProperty(self.DIAshutter, 'State', 0)
         self.mmc.setProperty(self.EPIshutter,  'State', 0)
-        self.mmc.setProperty(self.camera, 'Exposure', 50)
+        # setExposure() (not just setProperty) is what actually pushes the
+        # value to the camera AND updates MMCore's own cached exposure -
+        # using setProperty alone left this camera's live exposure tracking
+        # whatever a fluorescent snap had last set via setExposure().
+        self.mmc.setExposure(self.camera, self.LIVE_EXPOSURE_MS)
         self.mmc.setProperty(self.core, 'Shutter', self.DIAshutter)
         self.mmc.setProperty(self.lightpath, 'Label', self.camerapath)
         self.mmc.initializeCircularBuffer()
         self.mmc.prepareSequenceAcquisition(self.camera)
         self.mmc.waitForDevice(self.DIAshutter)
         self.mmc.waitForDevice(self.camera)
-        self.mmc.startContinuousSequenceAcquisition(100)
+        # Interval between frames, in ms - this is what actually sets the fps
+        # (100 -> 10fps was the previous, unintended cap). LIVE_EXPOSURE_MS
+        # must stay below this for the camera to keep up.
+        self.mmc.startContinuousSequenceAcquisition(self.LIVE_INTERVAL_MS)
         while self._run_flag:
             # FIX: poll isSequenceRunning() every iteration instead of caching
             # a one-shot bool; catches camera timeout / buffer-overrun recovery
@@ -1033,6 +1113,11 @@ class DropletWorker(QThread):
         self.control_valve(a, state=True)
         self.control_valve(b, state=True)
 
+    def shrink_droplet(self, Chemostat_number):
+        self.control_valve(Chemostat_number + 11, state=True)
+        time.sleep(self.Shrink_duration)
+        self.control_valve(Chemostat_number + 11, state=False)
+
     def purge_inlet(self, *inlets: int):
         """
         Purge one or more inlets simultaneously.
@@ -1128,6 +1213,41 @@ class DropletWorker(QThread):
         self.control_valve(7, state=True)
 
 
+# ─────────────────────────────────────────────
+#  Experiment worker thread (generic)
+# ─────────────────────────────────────────────
+class ExperimentWorker(QThread):
+    """
+    Runs a single callable (one of the TimeLapse_Experiment* run-bodies) on
+    a background thread so the GUI event loop stays responsive for the
+    entire (potentially many-hour) duration. Generic and dumb by design -
+    per-experiment cleanup (closing valves/lamp/video to a safe state) lives
+    in each run-body's own try/finally, not here, since the safe state
+    differs per experiment type.
+
+    self.exc holds the formatted traceback string if the target raised an
+    exception other than ExperimentStopped (a clean, user-requested stop),
+    so the GUI-thread "finished" slot can tell the two apart and surface a
+    real failure without popping a dialog for a normal Stop click.
+    """
+    def __init__(self, target, *args, **kwargs):
+        super().__init__()
+        self.target = target
+        self.args   = args
+        self.kwargs = kwargs
+        self.exc    = None
+        self.stopped = False
+
+    def run(self):
+        try:
+            self.target(*self.args, **self.kwargs)
+        except ExperimentStopped:
+            self.stopped = True
+            print("Experiment stopped by user.")
+        except Exception:
+            self.exc = traceback.format_exc()
+            print(f"[ERROR] Experiment failed:\n{self.exc}")
+
 
 # ═══════════════════════════════════════════════════════════
 #  MAIN GUI
@@ -1135,6 +1255,8 @@ class DropletWorker(QThread):
 class MicroscopeControlGUI(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._setup_console_log()
+        self._setup_experiment_bridge()
         self.Numato_port  = Numato_device
         self.video_thread = None
         self.positions    = []
@@ -1143,11 +1265,84 @@ class MicroscopeControlGUI(QMainWindow):
         self.selected_exposures = []
         self.Chemostat_protocol_steps = []
         self.current_protocol_table_step = 0
+        self._experiment_stop_requested = False
+        self._exp_worker = None
         self._init_microscope()
         self._build_ui()
         self.setWindowTitle('Microscope Control')
         self.resize(1400, 860)
         self.show()
+
+    # ── experiment GUI-update bridge ───────────────────────
+    def _setup_experiment_bridge(self):
+        """
+        Connect the _ExperimentBridge signals to the slots that actually
+        touch widgets. control_valve/_fl_status/_sam2_status/_stop_live_video
+        emit through self._exp_bridge instead of writing widgets directly,
+        so they're safe to call from either the GUI thread (synchronous,
+        same-thread delivery) or a background ExperimentWorker thread
+        (auto-queued onto the GUI thread).
+        """
+        self._exp_bridge = _ExperimentBridge()
+        self._exp_bridge.valve_style_changed.connect(self._on_valve_style_changed)
+        self._exp_bridge.all_valves_reset.connect(self._on_all_valves_reset)
+        self._exp_bridge.status_text_changed.connect(self._on_status_text_changed)
+        self._exp_bridge.live_button_reset.connect(self._on_live_button_reset)
+        self._exp_bridge.error_dialog.connect(self._on_error_dialog)
+
+    @pyqtSlot(int, bool)
+    def _on_valve_style_changed(self, idx, state):
+        self.controls[idx].setStyleSheet(BTN_GREEN if state else BTN_RED)
+
+    @pyqtSlot(bool)
+    def _on_all_valves_reset(self, state):
+        style = BTN_GREEN if state else BTN_RED
+        for ctrl in self.controls:
+            ctrl.setStyleSheet(style)
+            ctrl.setChecked(state)
+
+    @pyqtSlot(str, str)
+    def _on_status_text_changed(self, which, text):
+        label = self.fl_status_label if which == "fl" else self.sam2_status_label
+        label.setText(text)
+
+    @pyqtSlot()
+    def _on_live_button_reset(self):
+        if hasattr(self, 'live_Button'):
+            self.live_Button.setChecked(False)
+            self.live_Button.setStyleSheet(BTN_RED)
+
+    @pyqtSlot(str, str)
+    def _on_error_dialog(self, title, message):
+        QMessageBox.critical(self, title, message)
+
+    # ── console log ───────────────────────────────────────
+    def _setup_console_log(self):
+        """
+        Redirect stdout/stderr so every print() (and uncaught traceback)
+        also gets mirrored into the on-screen log widgets built in tab 1
+        and tab 2, in addition to the real console. Installed before
+        anything else so early startup prints (_init_microscope, etc.)
+        are captured too - the widgets themselves don't exist yet at that
+        point, so _append_log just buffers/drops them until _build_ui()
+        creates console_log_tab1 / console_log_tab2.
+        """
+        self._log_buffer = ""
+        self._log_emitter = _LogEmitter()
+        self._log_emitter.message.connect(self._append_log)
+        self._real_stdout = sys.stdout
+        self._real_stderr = sys.stderr
+        sys.stdout = _StreamToLog(self._log_emitter, self._real_stdout)
+        sys.stderr = _StreamToLog(self._log_emitter, self._real_stderr)
+
+    def _append_log(self, text):
+        self._log_buffer += text
+        *complete_lines, self._log_buffer = self._log_buffer.split("\n")
+        widgets = [w for w in (getattr(self, "console_log_tab1", None),
+                                getattr(self, "console_log_tab2", None)) if w is not None]
+        for line in complete_lines:
+            for widget in widgets:
+                widget.appendPlainText(line)
 
     # ── microscope init ───────────────────────────────────
     def _init_microscope(self):
@@ -1476,6 +1671,16 @@ class MicroscopeControlGUI(QMainWindow):
         buf_layout.addWidget(self.buffer_inlet_Input)
         right.addWidget(group("Buffer Inlet", buf_layout))
 
+        # -- Console log
+        self.console_log_tab1 = QPlainTextEdit()
+        self.console_log_tab1.setReadOnly(True)
+        self.console_log_tab1.setMaximumBlockCount(2000)
+        self.console_log_tab1.setStyleSheet(CONSOLE_LOG_STYLE)
+        self.console_log_tab1.setFixedHeight(160)
+        log_layout1 = QVBoxLayout()
+        log_layout1.addWidget(self.console_log_tab1)
+        right.addWidget(group("Console Log", log_layout1))
+
         right.addStretch()
 
         root.addLayout(left, 3)
@@ -1666,10 +1871,22 @@ class MicroscopeControlGUI(QMainWindow):
         self.stop_experiment_button.setStyleSheet(BTN_RED)
         self.start_experiment_button.setMinimumHeight(36)
         self.stop_experiment_button.setMinimumHeight(36)
+        self.stop_experiment_button.setEnabled(False)
         self.start_experiment_button.clicked.connect(self._on_start_experiment)
+        self.stop_experiment_button.clicked.connect(self._on_stop_experiment)
         exp_layout.addWidget(self.start_experiment_button)
         exp_layout.addWidget(self.stop_experiment_button)
         right.addWidget(group("Experiment Control", exp_layout))
+
+        # -- Console log
+        self.console_log_tab2 = QPlainTextEdit()
+        self.console_log_tab2.setReadOnly(True)
+        self.console_log_tab2.setMaximumBlockCount(2000)
+        self.console_log_tab2.setStyleSheet(CONSOLE_LOG_STYLE)
+        self.console_log_tab2.setFixedHeight(160)
+        log_layout2 = QVBoxLayout()
+        log_layout2.addWidget(self.console_log_tab2)
+        right.addWidget(group("Console Log", log_layout2))
 
         right.addStretch()
 
@@ -1713,9 +1930,10 @@ class MicroscopeControlGUI(QMainWindow):
         if self.video_thread is not None and self.video_thread.isRunning():
             self.video_thread.stop()
             self.video_thread = None
-        if hasattr(self, 'live_Button'):
-            self.live_Button.setChecked(False)
-            self.live_Button.setStyleSheet(BTN_RED)
+        # Routed through the bridge (see _ExperimentBridge) since this is
+        # called from inside snap_DIA_image/snap_EPI_image, which the
+        # experiment methods call heavily from a background thread.
+        self._exp_bridge.live_button_reset.emit()
 
     def snap_DIA_image(self):
         self._stop_live_video()
@@ -1883,11 +2101,13 @@ class MicroscopeControlGUI(QMainWindow):
 
     def control_valve(self, idx, state):
         relay_id = self.get_relay_id(idx)
+        # Emitted through the bridge (not a direct widget write) so this is
+        # safe to call from a background ExperimentWorker thread as well as
+        # the GUI thread - see _ExperimentBridge.
+        self._exp_bridge.valve_style_changed.emit(idx, state)
         if state:
-            self.controls[idx].setStyleSheet(BTN_GREEN)
             self.send_relay_command(f"relay off {relay_id}")
         else:
-            self.controls[idx].setStyleSheet(BTN_RED)
             self.send_relay_command(f"relay on {relay_id}")
 
     def _inlet_to_valves(self, inlet: int) -> tuple:
@@ -1934,10 +2154,43 @@ class MicroscopeControlGUI(QMainWindow):
         self.send_relay_command('open all')
 
     def all_on_callback(self):
-        for i, ctrl in enumerate(self.controls):
-            ctrl.setStyleSheet(BTN_GREEN); ctrl.setChecked(True)
+        # Widget touches routed through the bridge (not direct) so this is
+        # safe to call from a background ExperimentWorker thread as well as
+        # the GUI thread - see _safe_shutdown_valves, which calls this at
+        # an experiment's safe checkpoint (Stop or an unhandled exception).
+        self._exp_bridge.all_valves_reset.emit(True)
+        for i in range(len(self.controls)):
             self.send_relay_command(f"relay off {self.get_relay_id(i)}")
         self.send_relay_command('close all')
+
+    def _safe_shutdown_valves(self):
+        """
+        Best-effort safe-state reset. Called from the finally: block of
+        every experiment run-body - on normal completion, on Stop, and on
+        any unhandled exception - so there is exactly one cleanup path
+        instead of separate "normal tail" vs. "exception" cleanup code
+        that could drift out of sync. Turns the DIA lamp off, closes both
+        shutters, stops the live-view thread if one is running, and resets
+        every valve via all_on_callback() - the same reset closeEvent
+        already uses on normal app shutdown - which is itself safe to call
+        from either the GUI thread or a background ExperimentWorker thread.
+        """
+        try:
+            self.mmc.setProperty(self.DIAlamp, 'State', 0)
+            self.mmc.setProperty(self.EPIshutter, 'State', 0)
+            self.mmc.setProperty(self.DIAshutter, 'State', 0)
+        except Exception:
+            print(f"[WARN] _safe_shutdown_valves: failed to reset lamp/shutters:\n{traceback.format_exc()}")
+        if self.video_thread is not None and self.video_thread.isRunning():
+            try:
+                self.video_thread.stop()
+            except Exception:
+                print(f"[WARN] _safe_shutdown_valves: failed to stop video thread:\n{traceback.format_exc()}")
+            self.video_thread = None
+        try:
+            self.all_on_callback()
+        except Exception:
+            print(f"[WARN] _safe_shutdown_valves: failed to reset valves via all_on_callback:\n{traceback.format_exc()}")
 
     def send_relay_command(self, command):
         if self.Numato_port and self.Numato_port.is_open:
@@ -1945,7 +2198,13 @@ class MicroscopeControlGUI(QMainWindow):
                 self.Numato_port.write(f"{command}\r".encode('utf-8'))
                 time.sleep(0.005)
             except serial.SerialException:
-                QMessageBox.critical(self, 'Error', 'Failed to communicate with the device')
+                # print (thread-safe via the console log) instead of a
+                # direct QMessageBox.critical - this runs continuously from
+                # a background ExperimentWorker during an experiment, and a
+                # modal dialog is not safe to pop from a non-GUI thread.
+                print(f"[ERROR] Failed to communicate with relay device: {command!r}")
+                self._exp_bridge.error_dialog.emit(
+                    'Error', 'Failed to communicate with the relay device')
 
     # ── droplet slots ─────────────────────────
     def Characterize_Droplet(self, inlet_1, inlet_2):
@@ -2083,13 +2342,43 @@ class MicroscopeControlGUI(QMainWindow):
         if folder:
             os.chdir(folder)
             self.directory_input.setText(folder)
-    
+
+    # ── experiment stop/cancellation ───────────────────────
+    def _on_stop_experiment(self):
+        """Stop button handler. Sets a flag the running experiment checks
+        at its next safe checkpoint (between ticks, positions, or chemostat
+        steps) - it does not interrupt mid valve-sequence. The actual
+        all_on_callback() valve reset happens there too, via
+        _safe_shutdown_valves(), once the worker actually unwinds."""
+        self._experiment_stop_requested = True
+        print("Stop requested - will halt at next safe checkpoint.")
+
+    def _check_stop_and_sleep_chunked(self, total_seconds):
+        """
+        Sleep for total_seconds, but in ~1s chunks, checking the stop flag
+        each time - so Stop takes effect within ~1s instead of requiring
+        the full (potentially many-minutes) wait to elapse. Raises
+        ExperimentStopped as soon as the flag is seen set.
+        """
+        remaining = total_seconds
+        while remaining > 0:
+            if self._experiment_stop_requested:
+                raise ExperimentStopped()
+            chunk = min(1.0, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+        if self._experiment_stop_requested:
+            raise ExperimentStopped()
+
     def _fl_status(self, msg: str):
         """Update the FL segmentation status label and print to console."""
         print(f"[FL-SEG] {msg}")
         if hasattr(self, "fl_status_label"):
-            self.fl_status_label.setText(f"Status: {msg}")
-            QApplication.processEvents()
+            # Emitted through the bridge so this is safe to call from a
+            # background ExperimentWorker thread as well as the GUI thread.
+            # No QApplication.processEvents() needed anymore - the caller
+            # no longer blocks the event loop, so it repaints on its own.
+            self._exp_bridge.status_text_changed.emit("fl", f"Status: {msg}")
 
     def _build_fl_panel(self, parent_layout):
         """Build the FL Segmentation tab."""
@@ -2109,25 +2398,66 @@ class MicroscopeControlGUI(QMainWindow):
         info.setWordWrap(True)
         parent_layout.addWidget(info)
 
-        btn = QPushButton("▶  Start FL-segmentation timelapse")
-        btn.setStyleSheet(BTN_GREEN)
-        btn.setMinimumHeight(38)
-        btn.clicked.connect(
-            lambda: self.TimeLapse_Experiment_FL(
+        self.fl_start_button = QPushButton("▶  Start FL-segmentation timelapse")
+        self.fl_start_button.setStyleSheet(BTN_GREEN)
+        self.fl_start_button.setMinimumHeight(38)
+        self.fl_start_button.clicked.connect(
+            lambda: self._start_fl_experiment(
                 interval_min=int(self.cycle_Interval_Input.text()),
                 total_min=int(self.cycle_Input.text()),
             )
         )
-        parent_layout.addWidget(btn)
+        parent_layout.addWidget(self.fl_start_button)
 
         self.fl_status_label = QLabel("Status: idle")
         self.fl_status_label.setStyleSheet("color:#ffcc44; font-size:11px;")
         parent_layout.addWidget(self.fl_status_label)
         parent_layout.addStretch()
 
-    def TimeLapse_Experiment_FL(self, interval_min: int, total_min: int):
+    def _start_fl_experiment(self, interval_min: int, total_min: int):
+        """
+        GUI-thread entry point for the FL-segmentation timelapse: does the
+        validation (QMessageBox dialogs are not safe from a worker thread)
+        and snapshots widget/shared-state reads into plain locals, then
+        hands off to _run_fl_experiment_body on a background
+        ExperimentWorker. See _run_fl_experiment_body's docstring for what
+        the experiment actually does.
+        """
+        if not self.positions:
+            QMessageBox.warning(self, "No positions",
+                                "Save at least one stage position first.")
+            return
+        if not self.selected_exposures:
+            QMessageBox.warning(self, "No exposures",
+                                "Set at least one filter/exposure in the "
+                                "Timelapse Setup tab and click Save Values.")
+            return
+        if interval_min <= 0 or total_min <= 0:
+            QMessageBox.warning(self, "Invalid timing",
+                                "Set a non-zero interval and total duration.")
+            return
+
+        base      = self.directory_input.text().strip() or "."
+        purge_dur = float(self.purge_duration_Input.text())
+        flow_dur  = float(self.flow_duration_Input.text())
+        drive_dur = float(self.drive_duration_Input.text())
+
+        self._launch_experiment_worker(
+            self._run_fl_experiment_body,
+            interval_min, total_min, base, purge_dur, flow_dur, drive_dur,
+            # Snapshot into fresh lists - see the fallback path's launch
+            # for why (the user can still click Save/Clear Position or Add
+            # Step while this worker thread is running).
+            list(self.positions), list(self.selected_exposures),
+            list(self.Chemostat_protocol_steps),
+        )
+
+    def _run_fl_experiment_body(self, interval_min, total_min, base,
+                                 purge_dur, flow_dur, drive_dur,
+                                 positions, selected_exposures, chemostat_steps):
         """
         FL-segmentation timelapse — no SAM2, no pre-annotation required.
+        Runs on a background ExperimentWorker thread (see _start_fl_experiment).
 
         Every `interval_min` minutes for `total_min` total minutes:
           1. Move to every position and snap FL images for all filters
@@ -2151,24 +2481,21 @@ class MicroscopeControlGUI(QMainWindow):
               Pos1_Loop1_filt2_50ms_3min.tiff
               …
         """
-        if not self.positions:
-            QMessageBox.warning(self, "No positions",
-                                "Save at least one stage position first.")
-            return
-        if not self.selected_exposures:
-            QMessageBox.warning(self, "No exposures",
-                                "Set at least one filter/exposure in the "
-                                "Timelapse Setup tab and click Save Values.")
-            return
-        if interval_min <= 0 or total_min <= 0:
-            QMessageBox.warning(self, "Invalid timing",
-                                "Set a non-zero interval and total duration.")
-            return
+        try:
+            self._run_fl_experiment_body_inner(
+                interval_min, total_min, base, purge_dur, flow_dur, drive_dur,
+                positions, selected_exposures, chemostat_steps)
+        except Exception:
+            # Stop (ExperimentStopped) or a real failure mid-run: reset to a
+            # known-safe state before propagating. Normal completion does
+            # NOT go through here - it has its own deliberate final
+            # valve-7 state at the end, which this must not stomp on.
+            self._safe_shutdown_valves()
+            raise
 
-        base         = self.directory_input.text().strip() or "."
-        purge_dur    = float(self.purge_duration_Input.text())
-        flow_dur     = float(self.flow_duration_Input.text())
-        drive_dur    = float(self.drive_duration_Input.text())
+    def _run_fl_experiment_body_inner(self, interval_min, total_min, base,
+                                       purge_dur, flow_dur, drive_dur,
+                                       positions, selected_exposures, chemostat_steps):
         interval_sec = interval_min * 60
         total_sec    = total_min    * 60
 
@@ -2206,7 +2533,7 @@ class MicroscopeControlGUI(QMainWindow):
             wait_for = tick_number * interval_sec - elapsed_sec
             if wait_for > 0:
                 self._fl_status(f"Waiting {wait_for:.0f} s until next imaging round …")
-                time.sleep(wait_for)
+                self._check_stop_and_sleep_chunked(wait_for)
 
             tick_number        += 1
             tick_wall_start     = time.time()
@@ -2223,9 +2550,11 @@ class MicroscopeControlGUI(QMainWindow):
             # ── Phase 1: first row of exposure table → area check, all positions ──
             # selected_exposures[0] is the first row the user filled in —
             # whichever filter/exposure that happens to be.
-            seg_filt, seg_exp = self.selected_exposures[0]
+            seg_filt, seg_exp = selected_exposures[0]
 
-            for idx, (px, py, pz) in enumerate(self.positions):
+            for idx, (px, py, pz) in enumerate(positions):
+                if self._experiment_stop_requested:
+                    raise ExperimentStopped()
                 pos_num  = idx + 1
                 pos_loop = pos_loop_count.get(idx, 0) + 1
                 initial  = initial_areas.get(idx, 0)
@@ -2299,7 +2628,7 @@ class MicroscopeControlGUI(QMainWindow):
             # ── Phase 2: remaining rows of exposure table → all positions ─────────
             # Only runs when at least one position was triggered this tick.
             # Row 0 was already imaged in Phase 1, so we start from row 1.
-            if len(self.selected_exposures) > 1:
+            if len(selected_exposures) > 1:
                 # Reset shutter state after chemostat protocol before imaging.
                 # The chemostat sequence leaves the hardware in an uncertain
                 # shutter state; explicitly closing both shutters and waiting
@@ -2309,7 +2638,9 @@ class MicroscopeControlGUI(QMainWindow):
                 self.mmc.waitForSystem()
                 time.sleep(1.0)
                 self._fl_status("Full exposure table imaging of all positions …")
-                for idx, (px, py, pz) in enumerate(self.positions):
+                for idx, (px, py, pz) in enumerate(positions):
+                    if self._experiment_stop_requested:
+                        raise ExperimentStopped()
                     pos_num  = idx + 1
                     pos_loop = pos_loop_count.get(idx, 0) + 1
 
@@ -2324,7 +2655,7 @@ class MicroscopeControlGUI(QMainWindow):
                     self.mmc.setTimeoutMs(5000)
                     time.sleep(0.3)
 
-                    for filt, exp in self.selected_exposures[1:]:
+                    for filt, exp in selected_exposures[1:]:
                         self._fl_status(
                             f"FL snap – Pos {pos_num}  Loop {pos_loop}  "
                             f"filt {filt}  {exp}ms  @ {time_tag_str}"
@@ -2340,13 +2671,13 @@ class MicroscopeControlGUI(QMainWindow):
             print(f"\n  ⚠ Triggered: {', '.join(names)}")
 
             # ── chemostat protocol for triggered positions only ────────────
-            if self.Chemostat_protocol_steps:
+            if chemostat_steps:
                 self._fl_status("Running chemostat for triggered positions …")
-                
+
                 self.open_inlet(self.Buffer_inlet)
                 time.sleep(2)
                 self.close_inlet(self.Buffer_inlet)
-                
+
 
                 '''for inlet_range in range[1,9]:
                     self.open_inlet(inlet_range)
@@ -2361,14 +2692,16 @@ class MicroscopeControlGUI(QMainWindow):
                 self.video_thread = VideoThread()
                 self.video_thread.start()
                 QtCore.QThread.msleep(300)
-                
-                
+
+
                 # ── HOLD DROPLETS IN PLACE ────────────
                 send_to_arduino(2)
                 send_to_arduino(4)
-                
 
-                for step in self.Chemostat_protocol_steps:
+
+                for step in chemostat_steps:
+                    if self._experiment_stop_requested:
+                        raise ExperimentStopped()
                     i1    = step["input1"]
                     i2    = step["input2"]
                     rings = step["rings"]
@@ -2378,7 +2711,7 @@ class MicroscopeControlGUI(QMainWindow):
 
                     for rn, active in enumerate(rings):
                         if active and (rn in triggered_positions):
-                            px, py, pz = self.positions[rn]
+                            px, py, pz = positions[rn]
                             self.mmc.setTimeoutMs(30000)
                             self.mmc.setXYPosition(px, py)
                             self.mmc.waitForDevice(self.mmc.getXYStageDevice())
@@ -2443,8 +2776,8 @@ class MicroscopeControlGUI(QMainWindow):
         """Update the SAM2 status label and print to console."""
         print(f"[SAM2] {msg}")
         if hasattr(self, "sam2_status_label"):
-            self.sam2_status_label.setText(f"Status: {msg}")
-            QApplication.processEvents()
+            # Emitted through the bridge - see _fl_status for why.
+            self._exp_bridge.status_text_changed.emit("sam2", f"Status: {msg}")
 
 
     # ── 1. SAM2 tab builder ─────────────────────────────────────────────────────
@@ -2469,17 +2802,19 @@ class MicroscopeControlGUI(QMainWindow):
             ("② Annotate all positions with SAM2",         BTN_BLUE,
             lambda: self.annotate_all_positions_sam2()),
             ("③ Start SAM2-tracked timelapse experiment",  BTN_GREEN,
-            lambda: self.TimeLapse_Experiment_SAM2(
+            lambda: self._start_sam2_experiment(
                 interval_min=int(self.cycle_Interval_Input.text()),
                 total_min=int(self.cycle_Input.text()),
             )),
         ]
+        self.sam2_step_buttons = []
         for label, style, slot in buttons:
             btn = QPushButton(label)
             btn.setStyleSheet(style)
             btn.setMinimumHeight(36)
             btn.clicked.connect(slot)
             parent_layout.addWidget(btn)
+            self.sam2_step_buttons.append(btn)
 
         self.sam2_status_label = QLabel("Status: idle")
         self.sam2_status_label.setStyleSheet("color:#ffcc44; font-size:11px;")
@@ -2590,9 +2925,57 @@ class MicroscopeControlGUI(QMainWindow):
 
 
     # ── 4. Steps 3-6: SAM2-tracked timelapse ────────────────────────────────────
-    def TimeLapse_Experiment_SAM2(self, interval_min: int, total_min: int):
+    def _start_sam2_experiment(self, interval_min: int, total_min: int):
         """
-        Time-driven timelapse with per-position SAM2 tracking.
+        GUI-thread entry point for the SAM2-tracked timelapse: does the
+        validation (QMessageBox dialogs are not safe from a worker thread)
+        and snapshots widget/shared-state reads into plain locals, then
+        hands off to _run_sam2_experiment_body on a background
+        ExperimentWorker. See _run_sam2_experiment_body's docstring for
+        what the experiment actually does.
+
+        self.sam2_mgr itself is NOT snapshotted (it's a stateful GPU/SAM2
+        manager object - ref_mask, pos_loop_count, initial_area, the
+        predictor - that can't be meaningfully copied); the run body keeps
+        reading/writing it directly. Avoid re-annotating positions or
+        recapturing BF images while a SAM2 experiment is running.
+        """
+        if not self.sam2_mgr.ref_mask:
+            QMessageBox.warning(self, "Not annotated",
+                                "Complete Steps ① and ② before starting.")
+            return
+        if not self.positions:
+            QMessageBox.warning(self, "No positions", "No stage positions saved.")
+            return
+
+        if interval_min <= 0 or total_min <= 0:
+            QMessageBox.warning(self, "Invalid timing",
+                                "Set a non-zero interval and total duration before starting.")
+            return
+
+        base = self.directory_input.text().strip() or "."
+        self.sam2_mgr.base_dir = base
+
+        purge_dur = float(self.purge_duration_Input.text())
+        flow_dur  = float(self.flow_duration_Input.text())
+        drive_dur = float(self.drive_duration_Input.text())
+
+        self._launch_experiment_worker(
+            self._run_sam2_experiment_body,
+            interval_min, total_min, base, purge_dur, flow_dur, drive_dur,
+            # Snapshot into fresh lists - see the fallback path's launch
+            # for why (the user can still click Save/Clear Position or Add
+            # Step while this worker thread is running).
+            list(self.positions), list(self.selected_exposures),
+            list(self.Chemostat_protocol_steps),
+        )
+
+    def _run_sam2_experiment_body(self, interval_min, total_min, base,
+                                   purge_dur, flow_dur, drive_dur,
+                                   positions, selected_exposures, chemostat_steps):
+        """
+        Time-driven timelapse with per-position SAM2 tracking. Runs on a
+        background ExperimentWorker thread (see _start_sam2_experiment).
 
         Parameters
         ----------
@@ -2617,25 +3000,21 @@ class MicroscopeControlGUI(QMainWindow):
                     • Reset that position's loop-BF list (context → initial only).
                     • Increment that position's loop counter.
         """
-        if not self.sam2_mgr.ref_mask:
-            QMessageBox.warning(self, "Not annotated",
-                                "Complete Steps ① and ② before starting.")
-            return
-        if not self.positions:
-            QMessageBox.warning(self, "No positions", "No stage positions saved.")
-            return
-        
-        if interval_min <= 0 or total_min <= 0:
-            QMessageBox.warning(self, "Invalid timing",
-                                "Set a non-zero interval and total duration before starting.")
-            return
+        try:
+            self._run_sam2_experiment_body_inner(
+                interval_min, total_min, base, purge_dur, flow_dur, drive_dur,
+                positions, selected_exposures, chemostat_steps)
+        except Exception:
+            # Stop (ExperimentStopped) or a real failure mid-run: reset to a
+            # known-safe state before propagating. Normal completion does
+            # NOT go through here - it has its own deliberate final
+            # valve-0 state at the end, which this must not stomp on.
+            self._safe_shutdown_valves()
+            raise
 
-        base = self.directory_input.text().strip() or "."
-        self.sam2_mgr.base_dir = base
-
-        purge_dur    = float(self.purge_duration_Input.text())
-        flow_dur     = float(self.flow_duration_Input.text())
-        drive_dur    = float(self.drive_duration_Input.text())
+    def _run_sam2_experiment_body_inner(self, interval_min, total_min, base,
+                                         purge_dur, flow_dur, drive_dur,
+                                         positions, selected_exposures, chemostat_steps):
         interval_sec = interval_min * 60
         total_sec    = total_min    * 60
 
@@ -2676,7 +3055,7 @@ class MicroscopeControlGUI(QMainWindow):
                 self._sam2_status(
                     f"Waiting {wait_for:.0f} s until next imaging round …"
                 )
-                time.sleep(wait_for)
+                self._check_stop_and_sleep_chunked(wait_for)
 
             # ── start of one imaging round ───────────────────────────────────────
             tick_number         += 1
@@ -2697,7 +3076,9 @@ class MicroscopeControlGUI(QMainWindow):
             self.DIALamp_activate()
 
             # ── Step 3: BF image every position, measure area ────────────────────
-            for idx, (px, py, pz) in enumerate(self.positions):
+            for idx, (px, py, pz) in enumerate(positions):
+                if self._experiment_stop_requested:
+                    raise ExperimentStopped()
                 pos_num  = idx + 1
                 # pos_loop is the 1-based loop label shown in filenames
                 pos_loop = self.sam2_mgr.pos_loop_count.get(idx, 0) + 1
@@ -2774,8 +3155,10 @@ class MicroscopeControlGUI(QMainWindow):
             print(f"\n  ⚠ Triggered this tick: {', '.join(names)}")
 
             # ── Step 5: FL imaging of triggered positions only ───────────────────
-            if self.selected_exposures:
+            if selected_exposures:
                 for idx in triggered_positions:
+                    if self._experiment_stop_requested:
+                        raise ExperimentStopped()
                     pos_num  = idx + 1
                     pos_loop = self.sam2_mgr.pos_loop_count.get(idx, 0) + 1
 
@@ -2785,7 +3168,7 @@ class MicroscopeControlGUI(QMainWindow):
                     self._sam2_status(
                         f"FL imaging – Pos {pos_num}  Loop {pos_loop}"
                     )
-                    px, py, pz = self.positions[idx]
+                    px, py, pz = positions[idx]
                     self.mmc.setTimeoutMs(30000)
                     self.mmc.setXYPosition(px, py)
                     self.mmc.waitForDevice(self.mmc.getXYStageDevice())
@@ -2793,7 +3176,7 @@ class MicroscopeControlGUI(QMainWindow):
                     self.mmc.waitForDevice(self.mmc.getFocusDevice())
                     time.sleep(0.3)
 
-                    for filt, exp in self.selected_exposures:
+                    for filt, exp in selected_exposures:
                         raw_fl = self.snap_EPI_image(filt, exp)
                         # e.g.  Pos1_Loop3_filt1_100ms_6min.tiff
                         fl_fname = (
@@ -2804,7 +3187,7 @@ class MicroscopeControlGUI(QMainWindow):
                         time.sleep(0.2)
 
             # ── Step 6: chemostat protocol for triggered positions only ──────────
-            if self.Chemostat_protocol_steps:
+            if chemostat_steps:
                 self._sam2_status(
                     "Running chemostat for triggered positions …"
                 )
@@ -2833,7 +3216,9 @@ class MicroscopeControlGUI(QMainWindow):
                 # the first start_recording() call
                 QtCore.QThread.msleep(300)
 
-                for step in self.Chemostat_protocol_steps:
+                for step in chemostat_steps:
+                    if self._experiment_stop_requested:
+                        raise ExperimentStopped()
                     i1    = step["input1"]
                     i2    = step["input2"]
                     rings = step["rings"]   # list[bool], one entry per position
@@ -2845,7 +3230,7 @@ class MicroscopeControlGUI(QMainWindow):
                     for rn, active in enumerate(rings):
                         # Only act if the ring is checked AND this pos was triggered
                         if active and (rn in triggered_positions):
-                            px, py, pz = self.positions[rn]
+                            px, py, pz = positions[rn]
                             self.mmc.setTimeoutMs(30000)
                             self.mmc.setXYPosition(px, py)
                             self.mmc.waitForDevice(self.mmc.getXYStageDevice())
@@ -2878,12 +3263,13 @@ class MicroscopeControlGUI(QMainWindow):
                             # Brief pause to let the writer flush before the next clip
                             QtCore.QThread.msleep(200)
 
+
                     # Close / re-open flush valves between steps
-                    self.control_valve(15, state=False)
-                    self.control_valve(7,  state=False)
-                    time.sleep(5)
-                    self.control_valve(15, state=True)
-                    self.control_valve(7,  state=True)
+                    self.open_inlet(self.Buffer_inlet)
+                    self.control_valve(6,  state=False)
+                    time.sleep(1)
+                    self.close_inlet(self.Buffer_inlet)
+                    self.control_valve(6,  state=True)
 
                 self.video_thread.stop()
                 self.video_thread = None
@@ -2912,9 +3298,28 @@ class MicroscopeControlGUI(QMainWindow):
     # ── timelapse experiment ──────────────────
     def TimeLapse_Experiment(self, num_loops, time_interval, positions_table,
                               selected_exposures, chemostat_protocol_table):
-        init_states = [(0,False),(1,True),(2,False),(3,True),(4,True),(5,False),
-                       (6,False),(7,True),(8,False),(9,False),(10,False),(11,False),
-                       (12,True),(13,True),(14,True),(15,True)]
+        try:
+            self._TimeLapse_Experiment_body(
+                num_loops, time_interval, positions_table,
+                selected_exposures, chemostat_protocol_table)
+        except Exception:
+            # Stop (ExperimentStopped) or a real failure mid-run: reset to a
+            # known-safe state before propagating so ExperimentWorker can
+            # log it. Normal completion does NOT go through here - it has
+            # its own deliberate final valve-0 state at the end of the body,
+            # which this must not stomp on.
+            self._safe_shutdown_valves()
+            raise
+
+    def _TimeLapse_Experiment_body(self, num_loops, time_interval, positions_table,
+                                    selected_exposures, chemostat_protocol_table):
+
+        # Initialise valves
+        init_states = [
+            (0, True), (1, True),  (2, True), (3, True),  (4, True),  (5, True),
+            (6, True), (7, False),  (8, True), (9, True), (10, False), (11, True),
+            (12, False), (13, False), (14, False), (15, False), (16, False), (17, False),
+        ]
         for v, s in init_states:
             self.control_valve(v, state=s)
 
@@ -2934,21 +3339,23 @@ class MicroscopeControlGUI(QMainWindow):
                     img = self.snap_EPI_image(filt, exp)
                     fn  = f"Expt_{ci+1}_{filt}_{exp}_{loop+1}.tiff"
                     time.sleep(0.2)
-                    img.save(os.path.join(".", fn))
+                    tiff.imwrite(os.path.join(".", fn), img)
 
             if self.Chemostat_protocol_steps:
-                self.control_valve(15, state=False); time.sleep(30)
-                self.control_valve(15, state=True)
-                self.control_valve(7,  state=False)
-                for v in [12, 13, 14, 15]:
-                    self.control_valve(v, state=False); time.sleep(5)
-                    self.control_valve(v, state=True)
-                self.control_valve(7, state=True)
-                self.mmc.setProperty(self.DIAlamp, 'State', 1)
+                self.open_inlet(self.Buffer_inlet)
+                time.sleep(2)
+                self.close_inlet(self.Buffer_inlet)
+                self.mmc.setProperty(self.DIAlamp, "State", 1)
+                if self.video_thread is not None and self.video_thread.isRunning():
+                    self.video_thread.stop()
+                    self.video_thread = None
                 self.video_thread = VideoThread()
                 self.video_thread.start()
+                QtCore.QThread.msleep(300)
 
                 for step in self.Chemostat_protocol_steps:
+                    send_to_arduino(2)
+                    send_to_arduino(4)
                     i1 = step["input1"]; i2 = step["input2"]
                     pw = DropletWorker("purge", inlets=[i1, i2], purge_duration=purge_duration)
                     pw.start(); pw.wait()
@@ -2961,21 +3368,34 @@ class MicroscopeControlGUI(QMainWindow):
                             self.video_thread.start_recording()
                             dw = DropletWorker("drive", i1, drive_duration=drive_duration, chemostat_number=rn+1)
                             dw.start(); dw.wait()
-                            self.video_thread.stop_recording()
-                    self.control_valve(15, state=False); self.control_valve(7, state=False)
-                    time.sleep(5)
-                    self.control_valve(15, state=True);  self.control_valve(7, state=True)
+                            if self.video_thread and self.video_thread.isRunning():
+                                self.video_thread.stop_recording()
+                            # Brief pause to let the writer flush before the next clip
+                            QtCore.QThread.msleep(200)
 
+
+                    # Close / re-open flush valves between steps
+                    self.open_inlet(self.Buffer_inlet)
+                    self.control_valve(6,  state=False)
+                    time.sleep(1)
+                    self.close_inlet(self.Buffer_inlet)
+                    self.control_valve(6,  state=True)
+                    
                 self.video_thread.stop()
-                self.mmc.setProperty(self.DIAlamp, 'State', 0)
+                self.video_thread = None
+                self.mmc.setProperty(self.DIAlamp, "State", 0)
+
+                self.control_valve(11, state=True)
+                send_to_arduino(4)
+                send_to_arduino(3)
+
 
             elapsed   = time.time() - loop_start
             remaining = time_interval * 60 - elapsed
             if remaining > 0:
                 print(f"Waiting {remaining:.1f}s …")
-                time.sleep(remaining)
+                self._check_stop_and_sleep_chunked(remaining)
 
-        
         self.mmc.setTimeoutMs(5000)  # restore default
         self._sam2_status("Experiment complete.")
         self.control_valve(0, state=True)
@@ -2998,24 +3418,82 @@ class MicroscopeControlGUI(QMainWindow):
         self._stop_live_video()
         active_tab = self.tabs.tabText(self.tabs.currentIndex())
         if active_tab == "FL Segmentation":
-            self.TimeLapse_Experiment_FL(
+            self._start_fl_experiment(
                 interval_min=int(self.cycle_Interval_Input.text()),
                 total_min=int(self.cycle_Input.text()),
             )
         elif self.sam2_mgr.ref_mask:
-            self.TimeLapse_Experiment_SAM2(
+            self._start_sam2_experiment(
                 interval_min=int(self.cycle_Interval_Input.text()),
                 total_min=int(self.cycle_Input.text()),
             )
         else:
-            self.TimeLapse_Experiment(
+            self._launch_experiment_worker(
+                self.TimeLapse_Experiment,
                 num_loops=int(self.cycle_Input.text()),
                 time_interval=int(self.cycle_Interval_Input.text()),
-                positions_table=self.positions,
-                selected_exposures=self.selected_exposures,
-                chemostat_protocol_table=self.Chemostat_protocol_steps,
+                # Snapshot into fresh lists rather than sharing the live
+                # attributes directly - the user can still click
+                # Save/Clear Position or Add Step while this worker thread
+                # is running, which would otherwise mutate the same list
+                # the worker is iterating over.
+                positions_table=list(self.positions),
+                selected_exposures=list(self.selected_exposures),
+                chemostat_protocol_table=list(self.Chemostat_protocol_steps),
             )
-            
+
+    def _launch_experiment_worker(self, target, *args, **kwargs):
+        """
+        Shared launch path for every experiment entry point (the main Start
+        Experiment button's three modes, and each tab's own Start button):
+        guards against starting a second experiment while one is already
+        running, resets the stop flag, flips Start/Stop button state, and
+        runs `target(*args, **kwargs)` on a background ExperimentWorker so
+        the GUI stays responsive for the run's full duration.
+
+        Returns True if launched, False if an experiment was already running
+        (in which case the caller should not proceed with its own setup).
+        """
+        if self._exp_worker is not None and self._exp_worker.isRunning():
+            print("An experiment is already running - ignoring Start.")
+            return False
+        self._experiment_stop_requested = False
+        self._set_experiment_controls_enabled(False)
+        self._exp_worker = ExperimentWorker(target, *args, **kwargs)
+        self._exp_worker.finished.connect(self._on_experiment_worker_finished)
+        self._exp_worker.start()
+        return True
+
+    def _set_experiment_controls_enabled(self, enabled: bool):
+        """
+        Enable/disable every control that would race a running
+        ExperimentWorker if clicked mid-run: the three experiment entry
+        points (so a second experiment can't be started concurrently),
+        Live/Record (self.video_thread is shared with the worker), and the
+        position/exposure/chemostat-step editing controls (editing them
+        mid-run wouldn't affect the already-snapshotted running worker, but
+        would misleadingly suggest it does).
+        """
+        self.start_experiment_button.setEnabled(enabled)
+        self.stop_experiment_button.setEnabled(not enabled)
+        for widget in (
+            self.fl_start_button, self.live_Button, self.record_button,
+            self.save_Position_button, self.replacePositionButton,
+            self.clearButton, self.GoToPositionButton, self.Save_Exposures_button,
+        ):
+            widget.setEnabled(enabled)
+        for widget in self.sam2_step_buttons:
+            widget.setEnabled(enabled)
+
+    @pyqtSlot()
+    def _on_experiment_worker_finished(self):
+        self._set_experiment_controls_enabled(True)
+        worker = self._exp_worker
+        self._exp_worker = None
+        if worker is not None and worker.exc:
+            QMessageBox.critical(
+                self, "Experiment failed",
+                f"The experiment stopped due to an error:\n\n{worker.exc}")
 
 
 
@@ -3024,6 +3502,8 @@ class MicroscopeControlGUI(QMainWindow):
         if self.Numato_port and self.Numato_port.is_open:
             self.Numato_port.close()
         arduino.close()
+        sys.stdout = self._real_stdout
+        sys.stderr = self._real_stderr
         event.accept()
 # ─────────────────────────────────────────────
 if __name__ == '__main__':
@@ -3042,7 +3522,7 @@ Pre-experiment (manual, before clicking Start):
 ①  capture_bf_for_all_positions()   – snap & save one BF per position
 ②  annotate_all_positions_sam2()    – interactive SAM2 point annotation
 
-Experiment (TimeLapse_Experiment_SAM2):
+Experiment (_start_sam2_experiment / _run_sam2_experiment_body):
 • Every `interval_min` minutes, BF-image ALL positions.
 • Each position keeps its own independent loop counter.
 • SAM2 context for position P at time T in loop L =
