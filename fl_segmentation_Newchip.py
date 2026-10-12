@@ -45,12 +45,60 @@ Relay_timeout  = 0.1
 # ─────────────────────────────────────────────
 #  Style helpers
 # ─────────────────────────────────────────────
-BTN_RED    = "background-color: #bb283a; color: white; border-radius: 4px; padding: 4px 8px;"
-BTN_GREEN  = "background-color: #2ac555; color: white; border-radius: 4px; padding: 4px 8px;"
-BTN_BLUE   = "background-color: #3a6bc9; color: white; border-radius: 4px; padding: 4px 8px;"
 BTN_YELLOW = "background-color: #d4a017; color: black; border-radius: 4px; padding: 4px 8px;"
-BTN_BLACK  = "background-color: #222222; color: white; border-radius: 4px; padding: 4px 8px;"
+
+
+def _pressable_button_style(bg, bg_hover, bg_pressed, fg, light_edge, dark_edge):
+    """
+    Button style with a raised edge (light top/left, thick dark bottom)
+    that inverts while the button is held down: the thick edge moves to
+    the top, so the face and label drop 1 px and the button looks pushed
+    into the panel, popping back out on release.
+    """
+    return (
+        f"QPushButton {{ background-color: {bg}; color: {fg};"
+        f" border-style: solid; border-width: 1px 1px 3px 1px;"
+        f" border-color: {light_edge} {dark_edge} {dark_edge} {light_edge};"
+        f" border-radius: 4px; padding: 4px 8px; }}"
+        f"QPushButton:hover {{ background-color: {bg_hover}; }}"
+        f"QPushButton:pressed {{ background-color: {bg_pressed};"
+        f" border-width: 3px 1px 1px 1px;"
+        f" border-color: {dark_edge} {light_edge} {light_edge} {dark_edge}; }}"
+        f"QPushButton:disabled {{ color: #77756f; }}"
+    )
+
+
+# Grey matching the Claude desktop app's dark-mode text box
+BTN_GREY  = _pressable_button_style("#30302e", "#3a3a37", "#232321", "#f0efea",
+                                    "#5a5a55", "#161615")
+BTN_BLACK = _pressable_button_style("#222222", "#2c2c2c", "#181818", "white",
+                                    "#4a4a4a", "#0e0e0e")
+
+
+def _colored_pressable_style(base, fg):
+    """_pressable_button_style with hover/pressed/edge shades derived from base."""
+    c = QtGui.QColor(base)
+    return _pressable_button_style(
+        base, c.lighter(115).name(), c.darker(125).name(), fg,
+        c.lighter(140).name(), c.darker(250).name())
+
+
+BTN_RED   = _colored_pressable_style("#bb283a", "white")
+BTN_GREEN = _colored_pressable_style("#2ac555", "white")
+
+
+# Filter turret buttons (tab 1), coloured after each filter's emission:
+# filter number -> (button colour, text colour)
+FILTER_BUTTON_COLORS = {
+    1: ("#3f6fe0", "white"),   # BFP-A      – blue
+    2: ("#2f9e4a", "white"),   # FITC-Green – green
+    3: ("#b8322a", "white"),   # TexasRed   – red
+    4: ("#a8379a", "white"),   # Cy5        – far-red, shown as magenta
+    5: ("#e0901e", "black"),   # Cy3        – orange
+    6: ("#d8d8d2", "black"),   # DIA        – white transmitted light
+}
 BTN_PURPLE = "background-color: #6a3db8; color: white; border-radius: 4px; padding: 4px 8px;"
+BTN_BLUE   = BTN_GREY   # old name; blue buttons are now grey
 
 LABEL_BOLD = "font-weight: bold; color: #cccccc;"
 GROUP_STYLE = """
@@ -243,11 +291,19 @@ else:
         arduino.close()
     exit()
 
+# Console messages for Arduino commands that switch the voltage
+ARDUINO_COMMAND_MESSAGES = {"2": "Voltage ON", "3": "Voltage OFF"}
+
+
 def send_to_arduino(data):
     arduino.write(f"{data}\n".encode())
+    if str(data) in ARDUINO_COMMAND_MESSAGES:
+        print(ARDUINO_COMMAND_MESSAGES[str(data)])
     time.sleep(0.1)
+    # Most commands get no reply - only print one if the Arduino sends it.
     response = arduino.readline().decode().strip()
-    print(f"Arduino Response: {response}" if response else "No response received.")
+    if response:
+        print(f"Arduino Response: {response}")
 
 def set_voltage(set_value):
     if str(set_value) == 'High':
@@ -1368,7 +1424,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.zoom40x = '4-S Plan Fluor 40x NA 0.60 Dry'
         self.zoom60x = '5-Plan Apo 60x NA 1.40 Oil'
         self.zoomempty = '6-Unknown'
-        self.filterNames = {1:'1- FITC', 2:'2- DAPI', 3:'3- BFP-A',
+        self.filterNames = {1:'1- BFP-A', 2:'2- FITC-Green', 3:'3- TexasRed',
                             4:'4- Cy5',  5:'5- Cy3',  6:'6- DIA'}
         # camera setup
         self.mmc.setProperty(self.camera, 'Sensor Cooler', 'ON')
@@ -1450,7 +1506,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.eyepathlight    = QPushButton("→ Eye")
         self.camerapathlight = QPushButton("→ Camera")
         for btn in (self.eyepathlight, self.camerapathlight):
-            btn.setStyleSheet(BTN_BLUE)
+            btn.setStyleSheet(BTN_GREY)
             btn.clicked.connect(self.PathtoCamera)
         obj_layout.addWidget(self.Zoom_list, 2)
         obj_layout.addWidget(self.camerapathlight, 1)
@@ -1462,7 +1518,10 @@ class MicroscopeControlGUI(QMainWindow):
         filter_grid.setSpacing(4)
         for fk, fv in self.filterNames.items():
             btn = QPushButton(fv)
-            btn.setStyleSheet(BTN_PURPLE)
+            if fk in FILTER_BUTTON_COLORS:
+                btn.setStyleSheet(_colored_pressable_style(*FILTER_BUTTON_COLORS[fk]))
+            else:
+                btn.setStyleSheet(BTN_GREY)
             btn.clicked.connect(lambda checked, fn=fk: self.change_filter(fn))
             r, c = divmod(fk - 1, 3)
             filter_grid.addWidget(btn, r, c)
@@ -1484,9 +1543,9 @@ class MicroscopeControlGUI(QMainWindow):
         self.save_Button   = QPushButton("Save Image")
         self.record_button = QPushButton("Start Recording")
         self.record_button.setCheckable(True)
-        for btn, style in [(self.snap_Button,   BTN_BLUE),
+        for btn, style in [(self.snap_Button,   BTN_GREY),
                            (self.live_Button,   BTN_RED),
-                           (self.save_Button,   BTN_BLUE),
+                           (self.save_Button,   BTN_GREY),
                            (self.record_button, BTN_RED)]:
             btn.setStyleSheet(style)
         self.snap_Button.clicked.connect(self.snap_DIA_image)
@@ -1515,7 +1574,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.Yplus  = QPushButton("Y+"); self.Yminus = QPushButton("Y−")
         self.Zplus  = QPushButton("Z+"); self.Zminus = QPushButton("Z−")
         for btn in (self.Xplus, self.Xminus, self.Yplus, self.Yminus, self.Zplus, self.Zminus):
-            btn.setStyleSheet(BTN_BLUE)
+            btn.setStyleSheet(BTN_GREY)
         self.Xplus.clicked.connect( lambda: self.mmc.setXYPosition(self.mmc.getXPosition(self.stage)+self.stage_speed, self.mmc.getYPosition(self.stage)))
         self.Xminus.clicked.connect(lambda: self.mmc.setXYPosition(self.mmc.getXPosition(self.stage)-self.stage_speed, self.mmc.getYPosition(self.stage)))
         self.Yplus.clicked.connect( lambda: self.mmc.setXYPosition(self.mmc.getXPosition(self.stage), self.mmc.getYPosition(self.stage)+self.stage_speed))
@@ -1550,7 +1609,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.clearButton           = QPushButton("Clear All")
         self.GoToPositionButton = QPushButton("Go to Position:")
         for btn, style in [(self.save_Position_button,  BTN_GREEN),
-                           (self.replacePositionButton, BTN_BLUE),
+                           (self.replacePositionButton, BTN_GREY),
                            (self.GoToPositionButton, BTN_BLACK),
                            (self.clearButton, BTN_RED)]:
             btn.setStyleSheet(style)
@@ -1582,9 +1641,9 @@ class MicroscopeControlGUI(QMainWindow):
             valve_grid.addWidget(btn, i // 7, i % 7)
         valve_btns = QHBoxLayout()
         self.stop_all_button = QPushButton("Stop All")
-        self.stop_all_button.setStyleSheet(BTN_BLACK)
+        self.stop_all_button.setStyleSheet(BTN_GREY)
         self.all_on_button   = QPushButton("All On")
-        self.all_on_button.setStyleSheet(BTN_BLUE)
+        self.all_on_button.setStyleSheet(BTN_GREY)
         self.stop_all_button.clicked.connect(self.stop_all_callback)
         self.all_on_button.clicked.connect(self.all_on_callback)
         valve_btns.addWidget(self.stop_all_button)
@@ -1726,7 +1785,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.quick_EPI_filter   = QSpinBox(); self.quick_EPI_filter.setRange(1,6); self.quick_EPI_filter.setValue(4)
         self.quick_EPI_exposure = QLineEdit("100")
         self.snap_EPI_button    = QPushButton("Snap Fluorescent Image")
-        self.snap_EPI_button.setStyleSheet(BTN_BLUE)
+        self.snap_EPI_button.setStyleSheet(BTN_GREY)
         self.snap_EPI_button.clicked.connect(
             lambda: self.snap_EPI_image(self.quick_EPI_filter.value(), int(self.quick_EPI_exposure.text())))
         quick_lbl_f = QLabel("Filter:"); quick_lbl_f.setStyleSheet("color:#aaa;")
@@ -1798,7 +1857,7 @@ class MicroscopeControlGUI(QMainWindow):
         # step buttons
         step_btn_layout = QVBoxLayout(); step_btn_layout.setSpacing(6)
         self.add_Step_button    = QPushButton("Add Step");        self.add_Step_button.setStyleSheet(BTN_GREEN)
-        self.clear_last_button  = QPushButton("Clear Last Step"); self.clear_last_button.setStyleSheet(BTN_BLUE)
+        self.clear_last_button  = QPushButton("Clear Last Step"); self.clear_last_button.setStyleSheet(BTN_GREY)
         self.clear_Steps_button = QPushButton("Clear All Steps"); self.clear_Steps_button.setStyleSheet(BTN_RED)
         self.export_button      = QPushButton("Export to CSV");   self.export_button.setStyleSheet(BTN_BLACK)
         self.add_Step_button.clicked.connect(self.add_loading_step)
@@ -1855,7 +1914,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.directory_input = QLineEdit()
         self.directory_input.setPlaceholderText("Save directory…")
         self.browse_button   = QPushButton("Browse")
-        self.browse_button.setStyleSheet(BTN_BLUE)
+        self.browse_button.setStyleSheet(BTN_GREY)
         self.browse_button.clicked.connect(self.browse_folder)
         dir_layout.addWidget(self.directory_input, 1)
         dir_layout.addWidget(self.browse_button)
@@ -2797,9 +2856,9 @@ class MicroscopeControlGUI(QMainWindow):
         parent_layout.addWidget(info)
 
         buttons = [
-            ("① Capture initial BF for all positions",     BTN_BLUE,
+            ("① Capture initial BF for all positions",     BTN_GREY,
             lambda: self.capture_bf_for_all_positions()),
-            ("② Annotate all positions with SAM2",         BTN_BLUE,
+            ("② Annotate all positions with SAM2",         BTN_GREY,
             lambda: self.annotate_all_positions_sam2()),
             ("③ Start SAM2-tracked timelapse experiment",  BTN_GREEN,
             lambda: self._start_sam2_experiment(
