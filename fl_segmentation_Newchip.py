@@ -21,14 +21,8 @@ import csv
 import cv2
 from skimage import exposure
 from collections import defaultdict
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import copy
 import tifffile as tiff
-import torch
-import shutil
-from glob import glob
-from sam2.build_sam import build_sam2_video_predictor
 
 # ─────────────────────────────────────────────
 #  Hardware constants
@@ -45,11 +39,58 @@ Relay_timeout  = 0.1
 # ─────────────────────────────────────────────
 #  Style helpers
 # ─────────────────────────────────────────────
-BTN_RED    = "background-color: #bb283a; color: white; border-radius: 4px; padding: 4px 8px;"
-BTN_GREEN  = "background-color: #2ac555; color: white; border-radius: 4px; padding: 4px 8px;"
-BTN_BLUE   = "background-color: #3a6bc9; color: white; border-radius: 4px; padding: 4px 8px;"
 BTN_YELLOW = "background-color: #d4a017; color: black; border-radius: 4px; padding: 4px 8px;"
-BTN_BLACK  = "background-color: #222222; color: white; border-radius: 4px; padding: 4px 8px;"
+
+
+def _pressable_button_style(bg, bg_hover, bg_pressed, fg, light_edge, dark_edge):
+    """
+    Button style with a raised edge (light top/left, thick dark bottom)
+    that inverts while the button is held down: the thick edge moves to
+    the top, so the face and label drop 1 px and the button looks pushed
+    into the panel, popping back out on release.
+    """
+    return (
+        f"QPushButton {{ background-color: {bg}; color: {fg};"
+        f" border-style: solid; border-width: 1px 1px 3px 1px;"
+        f" border-color: {light_edge} {dark_edge} {dark_edge} {light_edge};"
+        f" border-radius: 4px; padding: 4px 8px; }}"
+        f"QPushButton:hover {{ background-color: {bg_hover}; }}"
+        f"QPushButton:pressed {{ background-color: {bg_pressed};"
+        f" border-width: 3px 1px 1px 1px;"
+        f" border-color: {dark_edge} {light_edge} {light_edge} {dark_edge}; }}"
+        f"QPushButton:disabled {{ color: #77756f; }}"
+    )
+
+
+# Grey matching the Claude desktop app's dark-mode text box
+BTN_GREY  = _pressable_button_style("#30302e", "#3a3a37", "#232321", "#f0efea",
+                                    "#5a5a55", "#161615")
+BTN_BLACK = _pressable_button_style("#222222", "#2c2c2c", "#181818", "white",
+                                    "#4a4a4a", "#0e0e0e")
+
+
+def _colored_pressable_style(base, fg):
+    """_pressable_button_style with hover/pressed/edge shades derived from base."""
+    c = QtGui.QColor(base)
+    return _pressable_button_style(
+        base, c.lighter(115).name(), c.darker(125).name(), fg,
+        c.lighter(140).name(), c.darker(250).name())
+
+
+BTN_RED   = _colored_pressable_style("#bb283a", "white")
+BTN_GREEN = _colored_pressable_style("#2ac555", "white")
+
+
+# Filter turret buttons (tab 1), coloured after each filter's emission:
+# filter number -> (button colour, text colour)
+FILTER_BUTTON_COLORS = {
+    1: ("#3f6fe0", "white"),   # BFP-A      – blue
+    2: ("#2f9e4a", "white"),   # FITC-Green – green
+    3: ("#b8322a", "white"),   # TexasRed   – red
+    4: ("#a8379a", "white"),   # Cy5        – far-red, shown as magenta
+    5: ("#e0901e", "black"),   # Cy3        – orange
+    6: ("#d8d8d2", "black"),   # DIA        – white transmitted light
+}
 BTN_PURPLE = "background-color: #6a3db8; color: white; border-radius: 4px; padding: 4px 8px;"
 
 LABEL_BOLD = "font-weight: bold; color: #cccccc;"
@@ -243,11 +284,19 @@ else:
         arduino.close()
     exit()
 
+# Console messages for Arduino commands that switch the voltage
+ARDUINO_COMMAND_MESSAGES = {"2": "Voltage ON", "3": "Voltage OFF"}
+
+
 def send_to_arduino(data):
     arduino.write(f"{data}\n".encode())
+    if str(data) in ARDUINO_COMMAND_MESSAGES:
+        print(ARDUINO_COMMAND_MESSAGES[str(data)])
     time.sleep(0.1)
+    # Most commands get no reply - only print one if the Arduino sends it.
     response = arduino.readline().decode().strip()
-    print(f"Arduino Response: {response}" if response else "No response received.")
+    if response:
+        print(f"Arduino Response: {response}")
 
 def set_voltage(set_value):
     if str(set_value) == 'High':
@@ -272,12 +321,9 @@ def init_serial_port(relayport, relay_Baudrate, relay_timeout):
 
 Numato_device = init_serial_port(Relay_port, Relay_baudrate, Relay_timeout)
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  SAM2Config  –  edit paths / thresholds before use
-# ═══════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  FL droplet segmentation  –  no SAM2, no annotation required
+#  FL droplet segmentation  –  no annotation required
 # ═══════════════════════════════════════════════════════════════════════════
 
 def segment_droplet_fl(
@@ -471,308 +517,42 @@ def segment_droplet_fl(
     return final, area_px, overlay
 
 
-class SAM2Config:
-    CHECKPOINT     = "C:\SAM2/sam2.1_hiera_base_plus.pt"
-    MODEL_CONFIG   = "C:\SAM2/sam2.1_hiera_b+.yaml"
-    DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
-    OBJ_ID         = 1
-    MIN_COMP_AREA  = 200    # px² – discard mask fragments smaller than this
-    AREA_THRESHOLD = 0.80   # trigger chemostat when area < 70 % of initial
-    BF_EXPOSURE_MS = 20     # ms – brightfield snap exposure
+# Per-position operating modes for the FL-segmentation timelapse
+MODE_UPCONC   = "Upconcentration"
+MODE_SYNTH    = "Synthesis"
+MODE_MAINTAIN = "Maintain"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  SAM2Manager  –  all SAM2 logic, completely decoupled from the GUI
-# ═══════════════════════════════════════════════════════════════════════════
-
-class SAM2Manager:
+def inlet_pair_is_legal(a: int, b: int) -> bool:
     """
-    Owns the SAM2 video predictor and all per-position tracking state.
-
-    Per-position state (dicts keyed by 0-based position index):
-        ref_image_path  – path to the initial BF TIFF used during annotation
-        ref_mask        – cleaned boolean ndarray produced by annotation
-        initial_area    – droplet area (px) recorded from ref_mask
-        loop_bf_paths   – ordered list of BF TIFFs snapped in the *current*
-                          loop; reset to [] after each trigger
-        pos_loop_count  – number of completed loops (0 = never triggered,
-                          so currently in "Loop 1")
+    Two inlets can be opened together on the binary multiplexer only if
+    they share a group-A valve (V1-V3) or a group-B valve (V4-V6);
+    otherwise 4 distinct valves open and 4 inlets flow at once.
     """
+    return (a - 1) // 3 == (b - 1) // 3 or (a - 1) % 3 == (b - 1) % 3
 
-    def __init__(self):
-        self.predictor      = None   # loaded lazily on first use
-        self.base_dir       = "."
 
-        self.ref_image_path = {}   # {idx: str}
-        self.ref_mask       = {}   # {idx: np.ndarray bool}
-        self.initial_area   = {}   # {idx: int px}
-        self.loop_bf_paths  = {}   # {idx: list[str]}
-        self.pos_loop_count = {}   # {idx: int}
+def legal_partner_inlets(a: int) -> list:
+    return [b for b in range(1, 10) if inlet_pair_is_legal(a, b)]
 
-    # ── predictor ──────────────────────────────────────────────────────────
-    def load_predictor(self):
-        if self.predictor is None:
-            print("[SAM2] Loading predictor …")
-            self.predictor = build_sam2_video_predictor(
-                SAM2Config.MODEL_CONFIG,
-                SAM2Config.CHECKPOINT,
-                device=SAM2Config.DEVICE,
-            )
-            print("[SAM2] Predictor ready.")
 
-    # ── image helpers ───────────────────────────────────────────────────────
-    @staticmethod
-    def load_gray_uint8(path: str) -> np.ndarray:
-        """Read any TIFF/PNG → normalised uint8 grayscale 2-D array."""
-        img = tiff.imread(path)
-        if img.ndim > 2:
-            img = img[..., 0]
-        img = img.astype(np.float32)
-        return cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+def droplet_fluorescence(raw_fl: np.ndarray, mask: np.ndarray):
+    """
+    Background-subtracted droplet fluorescence:
+        median(raw_fl inside mask) - median(raw_fl outside mask)
 
-    @staticmethod
-    def write_sam2_frame_folder(image_paths: list, folder: str) -> str:
-        """
-        Write a numbered JPG sequence into `folder` that SAM2 expects.
-        The folder is wiped and rebuilt each call so frame indices always
-        match the supplied image_paths list exactly.
-        """
-        if os.path.exists(folder):
-            shutil.rmtree(folder)
-        os.makedirs(folder)
-        for i, p in enumerate(image_paths):
-            gray = SAM2Manager.load_gray_uint8(p)
-            rgb  = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-            cv2.imwrite(
-                os.path.join(folder, f"{i:05d}.jpg"),
-                cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
-            )
-        return folder
+    Returns (fluo, median_inside, median_outside), or None if the mask is
+    empty or covers the whole frame.
+    """
+    if not mask.any() or mask.all():
+        return None
+    med_in  = float(np.median(raw_fl[mask]))
+    med_out = float(np.median(raw_fl[~mask]))
+    return med_in - med_out, med_in, med_out
 
-    # ── mask post-processing ────────────────────────────────────────────────
-    def clean_mask(self, mask: np.ndarray) -> np.ndarray:
-        """
-        1. Remove connected components smaller than MIN_COMP_AREA.
-        2. Bridge electrode-split regions with a convex hull.
-        3. Morphological closing to smooth edges.
-        Returns a boolean array.
-        """
-        u8 = mask.astype(np.uint8)
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(u8, 8)
-        cleaned = np.zeros_like(u8)
-        for i in range(1, n):
-            if stats[i, cv2.CC_STAT_AREA] >= SAM2Config.MIN_COMP_AREA:
-                cleaned[labels == i] = 1
 
-        contours, _ = cv2.findContours(
-            cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        if not contours:
-            return cleaned.astype(bool)
-        hull   = cv2.convexHull(np.vstack(contours))
-        filled = np.zeros_like(cleaned)
-        cv2.drawContours(filled, [hull], -1, 1, -1)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        filled = cv2.morphologyEx(filled, cv2.MORPH_CLOSE, kernel)
-        return filled.astype(bool)
-
-    # ── interactive annotation ──────────────────────────────────────────────
-    def annotate_frame_interactive(self, gray: np.ndarray, inference_state) -> np.ndarray:
-        """
-        Blocking matplotlib window for point-click annotation.
-          Left-click   = positive point (droplet interior)
-          Middle-click = negative point (background / electrode)
-          Right-click  = undo last point
-          Enter        = accept mask and close
-
-        Returns the cleaned boolean mask.
-        Raises RuntimeError if closed without any annotation.
-        """
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QPushButton, QLabel
-        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-        from matplotlib.figure import Figure
-        import matplotlib.pyplot as plt
-
-        predictor = self.predictor
-        points    = []
-        labels    = []
-        cur_mask  = [None]
-        mask_art  = [None]
-        pt_arts   = []
-
-        # ── build dialog ──────────────────────────────────────────
-        dialog = QDialog()
-        dialog.setWindowTitle("Annotate droplet – Left=droplet  Middle=background  Right=undo  Enter=accept")
-        dialog.resize(900, 900)
-        layout = QVBoxLayout(dialog)
-
-        fig    = Figure(figsize=(8, 8))
-        canvas = FigureCanvas(fig)
-        ax     = fig.add_subplot(111)
-        ax.imshow(gray, cmap="gray")
-        ax.set_title("Left = droplet  |  Middle = background  |  Right = undo  |  Enter = accept")
-        layout.addWidget(canvas)
-
-        info = QLabel("Click to annotate. Press Enter to accept.")
-        info.setStyleSheet("color:#aaa; font-size:11px;")
-        layout.addWidget(info)
-
-        accept_btn = QPushButton("Accept mask (or press Enter)")
-        accept_btn.setStyleSheet("background-color:#2ac555; color:white; padding:6px;")
-        accept_btn.clicked.connect(dialog.accept)
-        layout.addWidget(accept_btn)
-
-        # ── annotation helpers ────────────────────────────────────
-        def _redraw_points():
-            for a in pt_arts:
-                a.remove()
-            pt_arts.clear()
-            for (x, y), lab in zip(points, labels):
-                pt_arts.append(
-                    ax.plot(x, y, "go" if lab == 1 else "ro", markersize=7)[0]
-                )
-
-        def _run_sam2():
-            if not points:
-                return
-            pt_arr = np.array(points, dtype=np.float32)
-            lb_arr = np.array(labels, dtype=np.int32)
-            ctx = (
-                torch.autocast("cuda", dtype=torch.bfloat16)
-                if SAM2Config.DEVICE == "cuda"
-                else torch.autocast("cpu", enabled=False)
-            )
-            with torch.inference_mode(), ctx:
-                _, _, logits = predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=0,
-                    obj_id=SAM2Config.OBJ_ID,
-                    points=pt_arr,
-                    labels=lb_arr,
-                )
-            raw = (logits[0] > 0).cpu().numpy()
-            cur_mask[0] = np.squeeze(raw).astype(bool)
-
-            if mask_art[0] is not None:
-                mask_art[0].remove()
-            ov = np.zeros((*cur_mask[0].shape, 4), dtype=np.float32)
-            ov[cur_mask[0]] = [1.0, 0.35, 0.0, 0.45]
-            mask_art[0] = ax.imshow(ov)
-            _redraw_points()
-            canvas.draw()
-
-        def _onclick(ev):
-            if ev.inaxes != ax or ev.xdata is None:
-                return
-            x, y = float(ev.xdata), float(ev.ydata)
-            if ev.button == 1:
-                points.append([x, y]); labels.append(1)
-            elif ev.button == 2:
-                points.append([x, y]); labels.append(0)
-            elif ev.button == 3:
-                if not points:
-                    return
-                points.pop(); labels.pop()
-                if not points:
-                    if mask_art[0] is not None:
-                        mask_art[0].remove(); mask_art[0] = None
-                    _redraw_points(); canvas.draw(); return
-            _run_sam2()
-
-        def _onkey(ev):
-            if ev.key == "enter":
-                dialog.accept()
-
-        fig.canvas.mpl_connect("button_press_event", _onclick)
-        fig.canvas.mpl_connect("key_press_event",    _onkey)
-
-        # ── run the dialog (blocks inside the existing Qt event loop) ──
-        result = dialog.exec_()
-
-        if cur_mask[0] is None:
-            raise RuntimeError("No annotation given – add at least one positive point.")
-        return self.clean_mask(cur_mask[0])
-
-    # ── SAM2 propagation helpers ────────────────────────────────────────────
-    def _autocast_ctx(self):
-        if SAM2Config.DEVICE == "cuda":
-            return torch.autocast("cuda", dtype=torch.bfloat16)
-        return torch.autocast("cpu", enabled=False)
-
-    def _seed_state_with_mask(self, state, frame_idx: int, mask: np.ndarray):
-        with torch.inference_mode(), self._autocast_ctx():
-            self.predictor.add_new_mask(
-                inference_state=state,
-                frame_idx=frame_idx,
-                obj_id=SAM2Config.OBJ_ID,
-                mask=mask,   # full boolean mask, not just centroid
-            )
-
-    def measure_area_with_context(
-        self, pos_idx: int, new_bf_path: str
-    ) -> tuple:
-        """
-        Measure the droplet area in `new_bf_path` using a SAM2 inference
-        context built from:
-
-            frame 0          →  initial BF  (seeded with ref_mask centroid)
-            frames 1 … N     →  all BF images already in current loop
-            frame N+1        →  new_bf_path  (the frame we want to predict)
-
-        The initial frame is always frame 0 and always seeded with the
-        reference mask, regardless of how many loop frames have accumulated.
-
-        Returns (cleaned_mask: np.ndarray[bool], area_px: int).
-        """
-        self.load_predictor()
-
-        ref_img   = self.ref_image_path[pos_idx]
-        ref_mask  = self.ref_mask[pos_idx]
-        loop_imgs = self.loop_bf_paths.get(pos_idx, [])
-
-        # Full ordered frame list  [initial] + [loop so far] + [new frame]
-        all_frames      = [ref_img] + loop_imgs + [new_bf_path]
-        query_frame_idx = len(all_frames) - 1
-
-        # Write the numbered JPG folder SAM2 needs
-        tmp_dir = os.path.join(self.base_dir, f"_sam2_tmp_pos{pos_idx}")
-        self.write_sam2_frame_folder(all_frames, tmp_dir)
-
-        state = self.predictor.init_state(video_path=tmp_dir)
-
-        # Seed frame 0 (initial BF) with the reference mask centroid
-        self._seed_state_with_mask(state, frame_idx=0, mask=ref_mask)
-
-        # Propagate forward; keep only the prediction at the query frame
-        final_mask = None
-        with torch.inference_mode(), self._autocast_ctx():
-            for out_idx, _, out_logits in self.predictor.propagate_in_video(
-                state,
-                start_frame_idx=0,
-                max_frame_num_to_track=len(all_frames),
-            ):
-                if out_idx == query_frame_idx:
-                    raw        = (out_logits[0] > 0).cpu().numpy()
-                    final_mask = np.squeeze(raw).astype(bool)
-
-        if final_mask is None:
-            return np.zeros_like(ref_mask, dtype=bool), 0
-
-        cleaned = self.clean_mask(final_mask)
-        return cleaned, int(cleaned.sum())
-
-    # ── context management ──────────────────────────────────────────────────
-    def append_loop_bf(self, pos_idx: int, path: str):
-        """Add a newly captured BF to this position's current-loop list."""
-        self.loop_bf_paths.setdefault(pos_idx, []).append(path)
-
-    def reset_loop_context(self, pos_idx: int):
-        """
-        Called after a trigger.  Discards all current-loop BF images so the
-        next loop starts with only the initial frame as context.
-        """
-        self.loop_bf_paths[pos_idx] = []
-
+# Trigger a feed when droplet area drops below this fraction of initial
+FL_AREA_THRESHOLD = 0.80
 
 
 Microscope = {}
@@ -821,7 +601,7 @@ class _ExperimentBridge(QtCore.QObject):
     """
     GUI-update signals for the handful of widget writes that happen inside
     code also called from a background experiment thread (control_valve,
-    all_on_callback, _fl_status, _sam2_status, the live_Button reset in
+    all_on_callback, _fl_status, the live_Button reset in
     _stop_live_video). Qt's AutoConnection delivers these synchronously
     when emitter and receiver share a thread (i.e. zero behavior change
     for existing GUI-thread callers like valve-grid button clicks) and
@@ -830,7 +610,7 @@ class _ExperimentBridge(QtCore.QObject):
     """
     valve_style_changed = pyqtSignal(int, bool)   # idx, state
     all_valves_reset     = pyqtSignal(bool)        # state applied to every valve
-    status_text_changed = pyqtSignal(str, str)    # which label ("fl"/"sam2"), text
+    status_text_changed = pyqtSignal(str, str)    # which label ("fl"/"fl_mode"), text
     live_button_reset   = pyqtSignal()
     error_dialog        = pyqtSignal(str, str)    # title, message
 
@@ -1218,7 +998,7 @@ class DropletWorker(QThread):
 # ─────────────────────────────────────────────
 class ExperimentWorker(QThread):
     """
-    Runs a single callable (one of the TimeLapse_Experiment* run-bodies) on
+    Runs a single callable (one of the experiment run-bodies) on
     a background thread so the GUI event loop stays responsive for the
     entire (potentially many-hour) duration. Generic and dumb by design -
     per-experiment cleanup (closing valves/lamp/video to a safe state) lives
@@ -1260,11 +1040,8 @@ class MicroscopeControlGUI(QMainWindow):
         self.Numato_port  = Numato_device
         self.video_thread = None
         self.positions    = []
-        self.sam2_mgr     = SAM2Manager()
         self.Buffer_inlet = 9   # default buffer inlet (1-9); updated from UI
         self.selected_exposures = []
-        self.Chemostat_protocol_steps = []
-        self.current_protocol_table_step = 0
         self._experiment_stop_requested = False
         self._exp_worker = None
         self._init_microscope()
@@ -1277,7 +1054,7 @@ class MicroscopeControlGUI(QMainWindow):
     def _setup_experiment_bridge(self):
         """
         Connect the _ExperimentBridge signals to the slots that actually
-        touch widgets. control_valve/_fl_status/_sam2_status/_stop_live_video
+        touch widgets. control_valve/_fl_status/_stop_live_video
         emit through self._exp_bridge instead of writing widgets directly,
         so they're safe to call from either the GUI thread (synchronous,
         same-thread delivery) or a background ExperimentWorker thread
@@ -1303,7 +1080,10 @@ class MicroscopeControlGUI(QMainWindow):
 
     @pyqtSlot(str, str)
     def _on_status_text_changed(self, which, text):
-        label = self.fl_status_label if which == "fl" else self.sam2_status_label
+        label = {
+            "fl":      self.fl_status_label,
+            "fl_mode": self.fl_mode_label,
+        }[which]
         label.setText(text)
 
     @pyqtSlot()
@@ -1321,11 +1101,11 @@ class MicroscopeControlGUI(QMainWindow):
         """
         Redirect stdout/stderr so every print() (and uncaught traceback)
         also gets mirrored into the on-screen log widgets built in tab 1
-        and tab 2, in addition to the real console. Installed before
+        and the FL Segmentation tab, in addition to the real console. Installed before
         anything else so early startup prints (_init_microscope, etc.)
         are captured too - the widgets themselves don't exist yet at that
         point, so _append_log just buffers/drops them until _build_ui()
-        creates console_log_tab1 / console_log_tab2.
+        creates console_log_tab1 / console_log_fl.
         """
         self._log_buffer = ""
         self._log_emitter = _LogEmitter()
@@ -1339,7 +1119,7 @@ class MicroscopeControlGUI(QMainWindow):
         self._log_buffer += text
         *complete_lines, self._log_buffer = self._log_buffer.split("\n")
         widgets = [w for w in (getattr(self, "console_log_tab1", None),
-                                getattr(self, "console_log_tab2", None)) if w is not None]
+                                getattr(self, "console_log_fl", None)) if w is not None]
         for line in complete_lines:
             for widget in widgets:
                 widget.appendPlainText(line)
@@ -1368,7 +1148,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.zoom40x = '4-S Plan Fluor 40x NA 0.60 Dry'
         self.zoom60x = '5-Plan Apo 60x NA 1.40 Oil'
         self.zoomempty = '6-Unknown'
-        self.filterNames = {1:'1- FITC', 2:'2- DAPI', 3:'3- BFP-A',
+        self.filterNames = {1:'1- BFP-A', 2:'2- FITC-Green', 3:'3- TexasRed',
                             4:'4- Cy5',  5:'5- Cy3',  6:'6- DIA'}
         # camera setup
         self.mmc.setProperty(self.camera, 'Sensor Cooler', 'ON')
@@ -1399,12 +1179,6 @@ class MicroscopeControlGUI(QMainWindow):
         self.setCentralWidget(self.tabs)
 
         tab1 = QWidget(); self.tabs.addTab(tab1, "Microscope Control")
-        tab2 = QWidget(); self.tabs.addTab(tab2, "Timelapse Setup")
-
-        sam2_widget = QWidget()
-        sam2_layout = QVBoxLayout(sam2_widget)
-        self._build_sam2_panel(sam2_layout)
-        self.tabs.addTab(sam2_widget, "SAM2 Tracking")
 
         fl_widget = QWidget()
         fl_layout = QVBoxLayout(fl_widget)
@@ -1412,7 +1186,6 @@ class MicroscopeControlGUI(QMainWindow):
         self.tabs.addTab(fl_widget, "FL Segmentation")
 
         self._build_tab1(tab1)
-        self._build_tab2(tab2)
 
     # ══════════════════════════════════════════
     #  TAB 1 — Microscope Control
@@ -1450,7 +1223,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.eyepathlight    = QPushButton("→ Eye")
         self.camerapathlight = QPushButton("→ Camera")
         for btn in (self.eyepathlight, self.camerapathlight):
-            btn.setStyleSheet(BTN_BLUE)
+            btn.setStyleSheet(BTN_GREY)
             btn.clicked.connect(self.PathtoCamera)
         obj_layout.addWidget(self.Zoom_list, 2)
         obj_layout.addWidget(self.camerapathlight, 1)
@@ -1462,7 +1235,10 @@ class MicroscopeControlGUI(QMainWindow):
         filter_grid.setSpacing(4)
         for fk, fv in self.filterNames.items():
             btn = QPushButton(fv)
-            btn.setStyleSheet(BTN_PURPLE)
+            if fk in FILTER_BUTTON_COLORS:
+                btn.setStyleSheet(_colored_pressable_style(*FILTER_BUTTON_COLORS[fk]))
+            else:
+                btn.setStyleSheet(BTN_GREY)
             btn.clicked.connect(lambda checked, fn=fk: self.change_filter(fn))
             r, c = divmod(fk - 1, 3)
             filter_grid.addWidget(btn, r, c)
@@ -1484,9 +1260,9 @@ class MicroscopeControlGUI(QMainWindow):
         self.save_Button   = QPushButton("Save Image")
         self.record_button = QPushButton("Start Recording")
         self.record_button.setCheckable(True)
-        for btn, style in [(self.snap_Button,   BTN_BLUE),
+        for btn, style in [(self.snap_Button,   BTN_GREY),
                            (self.live_Button,   BTN_RED),
-                           (self.save_Button,   BTN_BLUE),
+                           (self.save_Button,   BTN_GREY),
                            (self.record_button, BTN_RED)]:
             btn.setStyleSheet(style)
         self.snap_Button.clicked.connect(self.snap_DIA_image)
@@ -1496,9 +1272,32 @@ class MicroscopeControlGUI(QMainWindow):
         for btn in (self.snap_Button, self.live_Button, self.save_Button, self.record_button):
             cap_layout.addWidget(btn)
 
+        # -- Quick fluorescence snap: filter + exposure, then snap
+        quick_fl_layout = QHBoxLayout()
+        quick_fl_layout.setSpacing(6)
+        self.quick_fl_filter = QSpinBox()
+        self.quick_fl_filter.setRange(1, 6)
+        self.quick_fl_filter.setValue(1)
+        self.quick_fl_filter.setToolTip(
+            "\n".join(self.filterNames[k] for k in sorted(self.filterNames)))
+        self.quick_fl_exposure = QSpinBox()
+        self.quick_fl_exposure.setRange(1, 10000)
+        self.quick_fl_exposure.setValue(100)
+        self.quick_fl_exposure.setSuffix(" ms")
+        self.quick_fl_snap_button = QPushButton("Quick Fluorescence Snap")
+        self.quick_fl_snap_button.setStyleSheet(BTN_GREY)
+        self.quick_fl_snap_button.clicked.connect(self._quick_fl_snap)
+        for lbl_text, w in (("Filter:", self.quick_fl_filter),
+                            ("Exposure:", self.quick_fl_exposure)):
+            lbl = QLabel(lbl_text); lbl.setStyleSheet("color:#aaa;")
+            quick_fl_layout.addWidget(lbl)
+            quick_fl_layout.addWidget(w)
+        quick_fl_layout.addWidget(self.quick_fl_snap_button, 1)
+
         viewer_layout = QVBoxLayout()
         viewer_layout.setSpacing(4)
         viewer_layout.addLayout(cap_layout)
+        viewer_layout.addLayout(quick_fl_layout)
         viewer_layout.addWidget(self.image_Live, 1)
         left.addWidget(group("Image Viewer", viewer_layout), 1)
 
@@ -1515,7 +1314,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.Yplus  = QPushButton("Y+"); self.Yminus = QPushButton("Y−")
         self.Zplus  = QPushButton("Z+"); self.Zminus = QPushButton("Z−")
         for btn in (self.Xplus, self.Xminus, self.Yplus, self.Yminus, self.Zplus, self.Zminus):
-            btn.setStyleSheet(BTN_BLUE)
+            btn.setStyleSheet(BTN_GREY)
         self.Xplus.clicked.connect( lambda: self.mmc.setXYPosition(self.mmc.getXPosition(self.stage)+self.stage_speed, self.mmc.getYPosition(self.stage)))
         self.Xminus.clicked.connect(lambda: self.mmc.setXYPosition(self.mmc.getXPosition(self.stage)-self.stage_speed, self.mmc.getYPosition(self.stage)))
         self.Yplus.clicked.connect( lambda: self.mmc.setXYPosition(self.mmc.getXPosition(self.stage), self.mmc.getYPosition(self.stage)+self.stage_speed))
@@ -1550,7 +1349,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.clearButton           = QPushButton("Clear All")
         self.GoToPositionButton = QPushButton("Go to Position:")
         for btn, style in [(self.save_Position_button,  BTN_GREEN),
-                           (self.replacePositionButton, BTN_BLUE),
+                           (self.replacePositionButton, BTN_GREY),
                            (self.GoToPositionButton, BTN_BLACK),
                            (self.clearButton, BTN_RED)]:
             btn.setStyleSheet(style)
@@ -1582,9 +1381,9 @@ class MicroscopeControlGUI(QMainWindow):
             valve_grid.addWidget(btn, i // 7, i % 7)
         valve_btns = QHBoxLayout()
         self.stop_all_button = QPushButton("Stop All")
-        self.stop_all_button.setStyleSheet(BTN_BLACK)
+        self.stop_all_button.setStyleSheet(BTN_GREY)
         self.all_on_button   = QPushButton("All On")
-        self.all_on_button.setStyleSheet(BTN_BLUE)
+        self.all_on_button.setStyleSheet(BTN_GREY)
         self.stop_all_button.clicked.connect(self.stop_all_callback)
         self.all_on_button.clicked.connect(self.all_on_callback)
         valve_btns.addWidget(self.stop_all_button)
@@ -1687,213 +1486,6 @@ class MicroscopeControlGUI(QMainWindow):
         root.addLayout(right, 2)
 
     # ══════════════════════════════════════════
-    #  TAB 2 — Timelapse Setup
-    # ══════════════════════════════════════════
-    def _build_tab2(self, parent):
-        root = QHBoxLayout(parent)
-        root.setSpacing(10)
-        root.setContentsMargins(10, 10, 10, 10)
-
-        # ── LEFT COLUMN ────────────────────────
-        left = QVBoxLayout()
-        left.setSpacing(8)
-
-        # -- Filter / exposure table
-        fe_layout = QVBoxLayout()
-        fe_layout.setSpacing(4)
-        fe_top = QHBoxLayout()
-        filter_list_layout = QVBoxLayout()
-        filter_list_layout.setSpacing(2)
-        for fk, fv in self.filterNames.items():
-            lbl = QLabel(fv); lbl.setStyleSheet("color:#aaa; font-size:11px;")
-            filter_list_layout.addWidget(lbl)
-        self.Exposures_table = QTableWidget(len(self.filterNames), 2)
-        self.Exposures_table.setHorizontalHeaderLabels(["Filter (1-6)", "Exposure (ms)"])
-        self.Exposures_table.verticalHeader().setDefaultSectionSize(24)
-        self.Exposures_table.setMaximumHeight(180)
-        for row in range(len(self.filterNames)):
-            sb1 = QSpinBox(); sb1.setRange(1, 6); sb1.setValue(row + 1)
-            sb2 = QSpinBox(); sb2.setRange(0, 1000); sb2.setValue(0)
-            self.Exposures_table.setCellWidget(row, 0, sb1)
-            self.Exposures_table.setCellWidget(row, 1, sb2)
-        self.Exposures_table.horizontalHeader().setStretchLastSection(True)
-        fe_top.addLayout(filter_list_layout)
-        fe_top.addWidget(self.Exposures_table, 1)
-        fe_bottom = QHBoxLayout()
-        self.Save_Exposures_button = QPushButton("Save Values")
-        self.Save_Exposures_button.setStyleSheet(BTN_GREEN)
-        self.Save_Exposures_button.clicked.connect(self.read_Exposure_values)
-        self.quick_EPI_filter   = QSpinBox(); self.quick_EPI_filter.setRange(1,6); self.quick_EPI_filter.setValue(4)
-        self.quick_EPI_exposure = QLineEdit("100")
-        self.snap_EPI_button    = QPushButton("Snap Fluorescent Image")
-        self.snap_EPI_button.setStyleSheet(BTN_BLUE)
-        self.snap_EPI_button.clicked.connect(
-            lambda: self.snap_EPI_image(self.quick_EPI_filter.value(), int(self.quick_EPI_exposure.text())))
-        quick_lbl_f = QLabel("Filter:"); quick_lbl_f.setStyleSheet("color:#aaa;")
-        quick_lbl_e = QLabel("Exposure:");quick_lbl_e.setStyleSheet("color:#aaa;")
-        fe_bottom.addWidget(self.Save_Exposures_button)
-        fe_bottom.addWidget(quick_lbl_f)
-        fe_bottom.addWidget(self.quick_EPI_filter)
-        fe_bottom.addWidget(quick_lbl_e)
-        fe_bottom.addWidget(self.quick_EPI_exposure)
-        fe_bottom.addWidget(self.snap_EPI_button)
-        fe_layout.addLayout(fe_top)
-        fe_layout.addLayout(fe_bottom)
-        left.addWidget(group("Fluorescence Imaging", fe_layout))
-
-        # -- Protocol definition
-        proto_top = QHBoxLayout()
-        proto_top.setSpacing(10)
-
-        # inputs spinboxes
-        # Valid inlet pairs for the binary multiplexer:
-        # Two inlets are safe to combine only if they share at least one valve
-        # (same group-A valve OR same group-B valve). If they differ in both
-        # groups, 4 distinct valves open, inadvertently activating 4 inlets.
-        self._valid_inlet_pairs = {
-            1: [1, 2, 3, 4, 7],
-            2: [1, 2, 3, 5, 8],
-            3: [1, 2, 3, 6, 9],
-            4: [1, 4, 5, 6, 7],
-            5: [2, 4, 5, 6, 8],
-            6: [3, 4, 5, 6, 9],
-            7: [1, 4, 7, 8, 9],
-            8: [2, 5, 7, 8, 9],
-            9: [3, 6, 7, 8, 9],
-        }
-
-        inp_layout = QGridLayout(); inp_layout.setSpacing(4)
-        self.Chemostat_inputs = []
-        for i in range(4):
-            lbl = QLabel(f"Input {i+1}:"); lbl.setStyleSheet("color:#aaa;")
-            sb  = QSpinBox(); sb.setRange(0, 9); sb.setValue(0)
-            inp_layout.addWidget(lbl, i, 0)
-            inp_layout.addWidget(sb,  i, 1)
-            self.Chemostat_inputs.append(sb)
-
-        # Label that shows which input2 values are valid given current input1
-        self._valid_i2_label = QLabel("Valid input 2: —")
-        self._valid_i2_label.setStyleSheet("color:#ffcc44; font-size:11px;")
-        self._valid_i2_label.setWordWrap(True)
-        inp_layout.addWidget(self._valid_i2_label, 4, 0, 1, 2)
-
-        def _update_valid_i2_label(val):
-            if val == 0:
-                self._valid_i2_label.setText("Valid input 2: —")
-            else:
-                valid = self._valid_inlet_pairs.get(val, [])
-                self._valid_i2_label.setText(f"Valid input 2: {valid}")
-        self.Chemostat_inputs[0].valueChanged.connect(_update_valid_i2_label)
-
-        proto_top.addWidget(group("Inputs", inp_layout))
-
-        # chemostat checkboxes
-        chem_layout = QVBoxLayout(); chem_layout.setSpacing(2)
-        self.Chemostats = []
-        for i in range(8):
-            cb = QCheckBox(f"Chemostat {i+1}"); cb.setStyleSheet("color:#ccc;")
-            chem_layout.addWidget(cb); self.Chemostats.append(cb)
-        proto_top.addWidget(group("Chemostats", chem_layout))
-
-        # step buttons
-        step_btn_layout = QVBoxLayout(); step_btn_layout.setSpacing(6)
-        self.add_Step_button    = QPushButton("Add Step");        self.add_Step_button.setStyleSheet(BTN_GREEN)
-        self.clear_last_button  = QPushButton("Clear Last Step"); self.clear_last_button.setStyleSheet(BTN_BLUE)
-        self.clear_Steps_button = QPushButton("Clear All Steps"); self.clear_Steps_button.setStyleSheet(BTN_RED)
-        self.export_button      = QPushButton("Export to CSV");   self.export_button.setStyleSheet(BTN_BLACK)
-        self.add_Step_button.clicked.connect(self.add_loading_step)
-        self.clear_last_button.clicked.connect(self.clear_last_step)
-        self.clear_Steps_button.clicked.connect(self.clear_all_steps)
-        self.export_button.clicked.connect(self.export_to_csv)
-        for btn in (self.add_Step_button, self.clear_last_button, self.clear_Steps_button, self.export_button):
-            step_btn_layout.addWidget(btn)
-        step_btn_layout.addStretch()
-        proto_top.addWidget(group("Actions", step_btn_layout))
-        left.addWidget(group("Protocol Definition", proto_top))
-
-        # -- Protocol table (scrollable)
-        self.Chemostat_protocol_table = QTableWidget()
-        self.Chemostat_protocol_table.setRowCount(10)
-        self.Chemostat_protocol_table.setColumnCount(8)
-        self.Chemostat_protocol_table.setVerticalHeaderLabels(
-            ["Input 1", "Input 2"] + [f"Chemostat {i+1}" for i in range(8)])
-        for c in range(8):
-            self.Chemostat_protocol_table.setHorizontalHeaderItem(c, QTableWidgetItem(f"Step {c+1}"))
-        for c in range(8):
-            for r in range(10):
-                if r < 2:
-                    self.Chemostat_protocol_table.setItem(r, c, QTableWidgetItem(""))
-                else:
-                    self.Chemostat_protocol_table.setCellWidget(r, c, self.create_centered_checkbox())
-        self.Chemostat_protocol_table.setStyleSheet("QTableWidget { gridline-color: #444; }")
-        self.Chemostat_protocol_table.verticalHeader().setDefaultSectionSize(24)
-        proto_tbl_layout = QVBoxLayout()
-        proto_tbl_layout.addWidget(self.Chemostat_protocol_table)
-        left.addWidget(group("Protocol Steps", proto_tbl_layout))
-        left.addStretch()
-
-        # ── RIGHT COLUMN ───────────────────────
-        right = QVBoxLayout()
-        right.setSpacing(8)
-
-        # -- Experiment timing
-        timing_grid = QGridLayout(); timing_grid.setSpacing(6)
-        self.cycle_Interval_Input = QLineEdit("0")
-        self.cycle_Input          = QLineEdit("0")
-        for r, (lbl, w) in enumerate([
-            ("Cycle interval (min):",      self.cycle_Interval_Input),
-            ("Total duration (min):",      self.cycle_Input)
-        ]):
-            l = QLabel(lbl); l.setStyleSheet("color:#aaa;")
-            timing_grid.addWidget(l, r, 0)
-            timing_grid.addWidget(w, r, 1)
-        self.interval = 0; self.cycles = 0
-        right.addWidget(group("Timing", timing_grid))
-
-        # -- Directory
-        dir_layout = QHBoxLayout(); dir_layout.setSpacing(4)
-        self.directory_input = QLineEdit()
-        self.directory_input.setPlaceholderText("Save directory…")
-        self.browse_button   = QPushButton("Browse")
-        self.browse_button.setStyleSheet(BTN_BLUE)
-        self.browse_button.clicked.connect(self.browse_folder)
-        dir_layout.addWidget(self.directory_input, 1)
-        dir_layout.addWidget(self.browse_button)
-        right.addWidget(group("Save Directory", dir_layout))
-
-        
-
-        # -- Experiment control
-        exp_layout = QVBoxLayout(); exp_layout.setSpacing(6)
-        self.start_experiment_button = QPushButton("▶  Start Experiment")
-        self.stop_experiment_button  = QPushButton("■  Stop Experiment")
-        self.start_experiment_button.setStyleSheet(BTN_GREEN)
-        self.stop_experiment_button.setStyleSheet(BTN_RED)
-        self.start_experiment_button.setMinimumHeight(36)
-        self.stop_experiment_button.setMinimumHeight(36)
-        self.stop_experiment_button.setEnabled(False)
-        self.start_experiment_button.clicked.connect(self._on_start_experiment)
-        self.stop_experiment_button.clicked.connect(self._on_stop_experiment)
-        exp_layout.addWidget(self.start_experiment_button)
-        exp_layout.addWidget(self.stop_experiment_button)
-        right.addWidget(group("Experiment Control", exp_layout))
-
-        # -- Console log
-        self.console_log_tab2 = QPlainTextEdit()
-        self.console_log_tab2.setReadOnly(True)
-        self.console_log_tab2.setMaximumBlockCount(2000)
-        self.console_log_tab2.setStyleSheet(CONSOLE_LOG_STYLE)
-        self.console_log_tab2.setFixedHeight(160)
-        log_layout2 = QVBoxLayout()
-        log_layout2.addWidget(self.console_log_tab2)
-        right.addWidget(group("Console Log", log_layout2))
-
-        right.addStretch()
-
-        root.addLayout(left,  3)
-        root.addLayout(right, 1)
-
-    # ══════════════════════════════════════════
     #  Microscope slots
     # ══════════════════════════════════════════
     def startstoplive_imaging(self):
@@ -1980,6 +1572,18 @@ class MicroscopeControlGUI(QMainWindow):
         self.image_Live.setPixmap(QPixmap.fromImage(self.myQImage).scaled(
             self.image_Live.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
         return rawImage    # ← raw uint16, not self.adjusted_image
+
+    def _quick_fl_snap(self):
+        """Tab 1 Quick Fluorescence Snap: snap_EPI_image with the chosen
+        filter/exposure; snap_EPI_image shows the result in image_Live."""
+        filt = self.quick_fl_filter.value()
+        exp  = self.quick_fl_exposure.value()
+        print(f"Quick fluorescence snap: {self.filterNames.get(filt, filt)}, {exp} ms")
+        try:
+            self.snap_EPI_image(filt, exp)
+        except Exception as e:
+            QMessageBox.critical(self, "Snap failed",
+                                 f"Quick fluorescence snap failed:\n\n{e}")
 
     def save_image(self):
         if not self.image_Live.pixmap():
@@ -2246,97 +1850,6 @@ class MicroscopeControlGUI(QMainWindow):
         self.cycles   = int(self.cycle_Input.text())
         print("Exposures:", self.selected_exposures, "| Interval:", self.interval, "| Experiment duration:", self.cycles)
 
-    def create_centered_checkbox(self):
-        frame  = QFrame()
-        layout = QHBoxLayout(frame)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setAlignment(Qt.AlignCenter)
-        cb = QCheckBox(frame); cb.setEnabled(False)
-        layout.addWidget(cb)
-        return frame
-
-    def add_loading_step(self):
-        selected_inputs = [sb.value() for sb in self.Chemostat_inputs if sb.value() > 0]
-        ring_status     = [cb.isChecked() for cb in self.Chemostats]
-        if not selected_inputs and not any(ring_status):
-            return
-
-        # Validate inlet pair against binary multiplexer constraints.
-        # Two inlets must share at least one valve to avoid inadvertently
-        # opening additional inlets via the multiplexer.
-        if len(selected_inputs) >= 2:
-            i1_val, i2_val = selected_inputs[0], selected_inputs[1]
-            valid_for_i1 = self._valid_inlet_pairs.get(i1_val, [])
-            if i2_val not in valid_for_i1:
-                QMessageBox.warning(
-                    self, "Invalid inlet combination",
-                    f"Inlet {i2_val} cannot be combined with inlet {i1_val}.\n\n"
-                    f"With the binary multiplexer, opening both would activate "
-                    f"additional inlets unintentionally.\n\n"
-                    f"Valid choices for input 2 when input 1 = {i1_val}:\n"
-                    f"{valid_for_i1}"
-                )
-                return
-
-        step = {
-            "input1": selected_inputs[0] if len(selected_inputs) > 0 else "",
-            "input2": selected_inputs[1] if len(selected_inputs) > 1 else "",
-            "rings":  ring_status
-        }
-        self.Chemostat_protocol_steps.append(step)
-        col = self.current_protocol_table_step
-        i1 = QTableWidgetItem(str(step["input1"])); i1.setTextAlignment(Qt.AlignCenter)
-        i2 = QTableWidgetItem(str(step["input2"])); i2.setTextAlignment(Qt.AlignCenter)
-        self.Chemostat_protocol_table.setItem(0, col, i1)
-        self.Chemostat_protocol_table.setItem(1, col, i2)
-        for i, is_on in enumerate(step["rings"]):
-            cb = QCheckBox(); cb.setChecked(is_on); cb.setEnabled(False)
-            w  = QWidget(); lyt = QVBoxLayout(w)
-            lyt.setContentsMargins(0, 0, 0, 0)
-            lyt.setAlignment(cb, Qt.AlignCenter)
-            lyt.addWidget(cb)
-            self.Chemostat_protocol_table.setCellWidget(2 + i, col, w)
-        self.current_protocol_table_step += 1
-
-    def clear_all_steps(self):
-        self.Chemostat_protocol_steps = []
-        self.current_protocol_table_step = 0
-        for c in range(self.Chemostat_protocol_table.columnCount()):
-            for r in range(self.Chemostat_protocol_table.rowCount()):
-                if r < 2:
-                    self.Chemostat_protocol_table.setItem(r, c, QTableWidgetItem(""))
-                else:
-                    self.Chemostat_protocol_table.setCellWidget(r, c, self.create_centered_checkbox())
-
-    def clear_last_step(self):
-        if not self.Chemostat_protocol_steps:
-            return
-        self.Chemostat_protocol_steps.pop()
-        self.current_protocol_table_step = max(0, self.current_protocol_table_step - 1)
-        col = self.current_protocol_table_step
-        for r in range(self.Chemostat_protocol_table.rowCount()):
-            if r < 2:
-                self.Chemostat_protocol_table.setItem(r, col, QTableWidgetItem(""))
-            else:
-                frame = self.Chemostat_protocol_table.cellWidget(r, col)
-                if frame:
-                    cb = frame.layout().itemAt(0).widget()
-                    if cb: cb.setChecked(False)
-
-    def export_to_csv(self):
-        if not self.Chemostat_protocol_steps:
-            return
-        fp, _ = QFileDialog.getSaveFileName(self, "Save Sequence to CSV", "",
-                                             "CSV Files (*.csv);;All Files (*)")
-        if not fp:
-            return
-        with open(fp, mode="w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["Step","Input 1","Input 2"] + [f"Ring {i+1}" for i in range(8)])
-            for idx, step in enumerate(self.Chemostat_protocol_steps, 1):
-                w.writerow([f"Step {idx}", step["input1"], step["input2"]]
-                           + ["ON" if s else "OFF" for s in step["rings"]])
-
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
         if folder:
@@ -2382,22 +1895,199 @@ class MicroscopeControlGUI(QMainWindow):
 
     def _build_fl_panel(self, parent_layout):
         """Build the FL Segmentation tab."""
+        root = QHBoxLayout()
+        root.setSpacing(10)
+        parent_layout.addLayout(root)
+        left  = QVBoxLayout(); left.setSpacing(8)
+        right = QVBoxLayout(); right.setSpacing(8)
+
         info = QLabel(
-            "SAM2-free segmentation mode — no pre-experiment annotation needed.\n\n"
+            "No pre-experiment annotation needed.\n\n"
             "Every imaging interval:\n"
             "  • FL image taken at every position (first filter/exposure\n"
             "    from the exposure table is used for segmentation;\n"
             "    all filters are saved)\n"
             "  • Droplet segmented via Otsu threshold + electrode bridge\n"
             f"  • Chemostat triggered if area < "
-            f"{SAM2Config.AREA_THRESHOLD * 100:.0f}% of initial area\n\n"
+            f"{FL_AREA_THRESHOLD * 100:.0f}% of initial area\n\n"
+            "Only the positions ticked below are fed. Each starts in\n"
+            "Upconcentration mode and is fed from the Upconcentration inlets.\n"
+            "Droplet fluorescence (median inside mask − median outside) is\n"
+            "measured each round; once it exceeds the position's own\n"
+            "Up-concentration Factor (F1-F3, picked next to its tick box)\n"
+            "× initial, the position switches to Synthesis: its next\n"
+            "replenishment uses the Synthesis inlets, after which it switches\n"
+            "to Maintain and is fed from the Maintain inlet for the rest of\n"
+            "the experiment. Two inlets are mixed into one droplet.\n\n"
             "Each position tracks its own loop counter independently.\n"
-            "Set imaging interval and total duration in the Timing panel."
+            "Set imaging interval, total duration and Up-concentration\n"
+            "Factors F1-F3 in the Timing panel."
         )
         info.setStyleSheet("color:#aaa; font-size:12px;")
         info.setWordWrap(True)
-        parent_layout.addWidget(info)
+        left.addWidget(info)
 
+        # -- Fluorescence Imaging: filter / exposure table
+        fe_layout = QVBoxLayout()
+        fe_layout.setSpacing(4)
+        fe_top = QHBoxLayout()
+        filter_list_layout = QVBoxLayout()
+        filter_list_layout.setSpacing(2)
+        for fk, fv in self.filterNames.items():
+            lbl = QLabel(fv); lbl.setStyleSheet("color:#aaa; font-size:11px;")
+            filter_list_layout.addWidget(lbl)
+        self.Exposures_table = QTableWidget(len(self.filterNames), 2)
+        self.Exposures_table.setHorizontalHeaderLabels(["Filter (1-6)", "Exposure (ms)"])
+        self.Exposures_table.verticalHeader().setDefaultSectionSize(24)
+        self.Exposures_table.setMaximumHeight(180)
+        for row in range(len(self.filterNames)):
+            sb1 = QSpinBox(); sb1.setRange(1, 6); sb1.setValue(row + 1)
+            sb2 = QSpinBox(); sb2.setRange(0, 1000); sb2.setValue(0)
+            self.Exposures_table.setCellWidget(row, 0, sb1)
+            self.Exposures_table.setCellWidget(row, 1, sb2)
+        self.Exposures_table.horizontalHeader().setStretchLastSection(True)
+        fe_top.addLayout(filter_list_layout)
+        fe_top.addWidget(self.Exposures_table, 1)
+        fe_bottom = QHBoxLayout()
+        self.Save_Exposures_button = QPushButton("Save Values")
+        self.Save_Exposures_button.setStyleSheet(BTN_GREEN)
+        self.Save_Exposures_button.clicked.connect(self.read_Exposure_values)
+        self.quick_EPI_filter   = QSpinBox(); self.quick_EPI_filter.setRange(1,6); self.quick_EPI_filter.setValue(4)
+        self.quick_EPI_exposure = QLineEdit("100")
+        self.snap_EPI_button    = QPushButton("Snap Fluorescent Image")
+        self.snap_EPI_button.setStyleSheet(BTN_GREY)
+        self.snap_EPI_button.clicked.connect(
+            lambda: self.snap_EPI_image(self.quick_EPI_filter.value(), int(self.quick_EPI_exposure.text())))
+        quick_lbl_f = QLabel("Filter:"); quick_lbl_f.setStyleSheet("color:#aaa;")
+        quick_lbl_e = QLabel("Exposure:");quick_lbl_e.setStyleSheet("color:#aaa;")
+        fe_bottom.addWidget(self.Save_Exposures_button)
+        fe_bottom.addWidget(quick_lbl_f)
+        fe_bottom.addWidget(self.quick_EPI_filter)
+        fe_bottom.addWidget(quick_lbl_e)
+        fe_bottom.addWidget(self.quick_EPI_exposure)
+        fe_bottom.addWidget(self.snap_EPI_button)
+        fe_layout.addLayout(fe_top)
+        fe_layout.addLayout(fe_bottom)
+        left.addWidget(group("Fluorescence Imaging", fe_layout))
+
+        # Mode table: one row under the headers
+        #   Positions | Upconcentration | Synthesis | Maintain
+        self.fl_mode_table = QTableWidget(1, 4)
+        self.fl_mode_table.setHorizontalHeaderLabels(
+            ["Positions", MODE_UPCONC, MODE_SYNTH, MODE_MAINTAIN])
+        self.fl_mode_table.verticalHeader().setVisible(False)
+        self.fl_mode_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.fl_mode_table.setFocusPolicy(Qt.NoFocus)
+
+        # Positions: checkboxes 1-8 (1-6 ticked by default), each with the
+        # Up-concentration Factor it uses (F1-F3 from the Timing panel;
+        # F1 by default).
+        pos_cell = QWidget()
+        pos_grid = QGridLayout(pos_cell)
+        pos_grid.setContentsMargins(4, 2, 4, 2)
+        pos_grid.setHorizontalSpacing(8); pos_grid.setVerticalSpacing(2)
+        self.fl_position_checks = []
+        self.fl_position_factor_choice = []   # QComboBox per position, index 0-2
+        for p in range(8):
+            cb = QCheckBox(str(p + 1)); cb.setChecked(p < 6)
+            factor_cb = QComboBox()
+            factor_cb.addItems(["F1", "F2", "F3"])
+            factor_cb.setToolTip(f"Up-concentration Factor for position {p + 1}")
+            r, c = p % 4, (p // 4) * 2
+            pos_grid.addWidget(cb, r, c)
+            pos_grid.addWidget(factor_cb, r, c + 1)
+            self.fl_position_checks.append(cb)
+            self.fl_position_factor_choice.append(factor_cb)
+        self.fl_mode_table.setCellWidget(0, 0, pos_cell)
+
+        # Inlet spinboxes per mode (0 = unused). Upconcentration and
+        # Synthesis take one or two inlets, Maintain takes one.
+        self.fl_mode_inlets = {}         # mode -> [QSpinBox, ...]
+        self._fl_mode_warn_labels = {}   # mode -> QLabel
+        for col, (mode, n_inlets) in enumerate(
+                [(MODE_UPCONC, 2), (MODE_SYNTH, 2), (MODE_MAINTAIN, 1)], start=1):
+            cell = QWidget()
+            cell_layout = QVBoxLayout(cell)
+            cell_layout.setContentsMargins(4, 2, 4, 2); cell_layout.setSpacing(2)
+            row = QHBoxLayout(); row.setSpacing(4)
+            boxes = []
+            for k in range(n_inlets):
+                sb = QSpinBox(); sb.setRange(0, 9)
+                sb.setSpecialValueText("—")
+                sb.setToolTip("Inlet 1-9 (— = unused)")
+                row.addWidget(sb); boxes.append(sb)
+            cell_layout.addLayout(row)
+            warn = QLabel(""); warn.setWordWrap(True)
+            warn.setStyleSheet("font-size:10px;")
+            cell_layout.addWidget(warn)
+            self.fl_mode_table.setCellWidget(0, col, cell)
+            self.fl_mode_inlets[mode] = boxes
+            self._fl_mode_warn_labels[mode] = warn
+            for sb in boxes:
+                sb.valueChanged.connect(
+                    lambda _v, m=mode: self._update_fl_inlet_warning(m))
+        self.fl_mode_inlets[MODE_UPCONC][0].setValue(1)
+        for mode in self.fl_mode_inlets:
+            self._update_fl_inlet_warning(mode)
+
+        self.fl_mode_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.Stretch)
+        self.fl_mode_table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeToContents)
+        self.fl_mode_table.verticalHeader().setDefaultSectionSize(124)
+        self.fl_mode_table.setFixedHeight(124 + 30)
+        mode_layout = QVBoxLayout()
+        mode_layout.addWidget(self.fl_mode_table)
+        left.addWidget(group("Feeding Modes", mode_layout))
+        left.addStretch()
+
+        # ── RIGHT COLUMN ───────────────────────
+        # -- Timing
+        timing_grid = QGridLayout(); timing_grid.setSpacing(6)
+        self.cycle_Interval_Input = QLineEdit("0")
+        self.cycle_Input          = QLineEdit("0")
+        # Up to 3 Up-concentration Factors (F1 required, F2/F3 optional).
+        # A position switches Upconcentration -> Synthesis once
+        # Fluo_Pos#_##min / Fluo_Pos#_initial exceeds the factor chosen for
+        # it in the Feeding Modes table.
+        self.upconc_factor_Inputs = []
+        for k, default in enumerate(["10", "", ""]):
+            le = QLineEdit(default)
+            validator = QtGui.QDoubleValidator(1.0, 50.0, 2, le)
+            validator.setNotation(QtGui.QDoubleValidator.StandardNotation)
+            le.setValidator(validator)
+            le.setToolTip("1 – 50" + ("" if k == 0 else " (optional)"))
+            if k:
+                le.setPlaceholderText("optional")
+            le.textChanged.connect(self._update_factor_choice_labels)
+            self.upconc_factor_Inputs.append(le)
+        for r, (lbl, w) in enumerate([
+            ("Cycle interval (min):",      self.cycle_Interval_Input),
+            ("Total duration (min):",      self.cycle_Input),
+            ("Up-concentration Factor F1:", self.upconc_factor_Inputs[0]),
+            ("Up-concentration Factor F2:", self.upconc_factor_Inputs[1]),
+            ("Up-concentration Factor F3:", self.upconc_factor_Inputs[2]),
+        ]):
+            l = QLabel(lbl); l.setStyleSheet("color:#aaa;")
+            timing_grid.addWidget(l, r, 0)
+            timing_grid.addWidget(w, r, 1)
+        self.interval = 0; self.cycles = 0
+        right.addWidget(group("Timing", timing_grid))
+        self._update_factor_choice_labels()
+
+        # -- Save Directory
+        dir_layout = QHBoxLayout(); dir_layout.setSpacing(4)
+        self.directory_input = QLineEdit()
+        self.directory_input.setPlaceholderText("Save directory…")
+        self.browse_button   = QPushButton("Browse")
+        self.browse_button.setStyleSheet(BTN_GREY)
+        self.browse_button.clicked.connect(self.browse_folder)
+        dir_layout.addWidget(self.directory_input, 1)
+        dir_layout.addWidget(self.browse_button)
+        right.addWidget(group("Save Directory", dir_layout))
+
+        # -- Experiment control
+        exp_layout = QVBoxLayout(); exp_layout.setSpacing(6)
         self.fl_start_button = QPushButton("▶  Start FL-segmentation timelapse")
         self.fl_start_button.setStyleSheet(BTN_GREEN)
         self.fl_start_button.setMinimumHeight(38)
@@ -2407,12 +2097,196 @@ class MicroscopeControlGUI(QMainWindow):
                 total_min=int(self.cycle_Input.text()),
             )
         )
-        parent_layout.addWidget(self.fl_start_button)
+        self.stop_experiment_button = QPushButton("■  Stop Experiment")
+        self.stop_experiment_button.setStyleSheet(BTN_RED)
+        self.stop_experiment_button.setMinimumHeight(38)
+        self.stop_experiment_button.setEnabled(False)
+        self.stop_experiment_button.clicked.connect(self._on_stop_experiment)
+        exp_layout.addWidget(self.fl_start_button)
+        exp_layout.addWidget(self.stop_experiment_button)
 
         self.fl_status_label = QLabel("Status: idle")
         self.fl_status_label.setStyleSheet("color:#ffcc44; font-size:11px;")
-        parent_layout.addWidget(self.fl_status_label)
-        parent_layout.addStretch()
+        self.fl_status_label.setWordWrap(True)
+        exp_layout.addWidget(self.fl_status_label)
+
+        self.fl_mode_label = QLabel("Modes: —")
+        self.fl_mode_label.setStyleSheet("color:#66ccff; font-size:11px;")
+        self.fl_mode_label.setWordWrap(True)
+        exp_layout.addWidget(self.fl_mode_label)
+        right.addWidget(group("Experiment Control", exp_layout))
+
+        # -- Console log
+        self.console_log_fl = QPlainTextEdit()
+        self.console_log_fl.setReadOnly(True)
+        self.console_log_fl.setMaximumBlockCount(2000)
+        self.console_log_fl.setStyleSheet(CONSOLE_LOG_STYLE)
+        self.console_log_fl.setMinimumHeight(160)
+        log_layout = QVBoxLayout()
+        log_layout.addWidget(self.console_log_fl)
+        right.addWidget(group("Console Log", log_layout), 1)
+
+        root.addLayout(left,  3)
+        root.addLayout(right, 2)
+
+    def _fl_mode_inlet_values(self, mode: str) -> list:
+        """Inlets (1-9) chosen for `mode` in the Feeding Modes table, deduplicated."""
+        inlets = []
+        for sb in self.fl_mode_inlets[mode]:
+            if sb.value() and sb.value() not in inlets:
+                inlets.append(sb.value())
+        return inlets
+
+    def _fl_inlet_problem(self, mode: str):
+        """Return a warning string for `mode`'s inlet choice, or None if OK."""
+        inlets = self._fl_mode_inlet_values(mode)
+        if not inlets:
+            return "No inlet selected"
+        if len(inlets) == 2 and not inlet_pair_is_legal(*inlets):
+            a, b = inlets
+            return (f"Illegal pair {a}+{b}: opens 4 valves "
+                    f"(valid with {a}: {legal_partner_inlets(a)})")
+        return None
+
+    def _update_fl_inlet_warning(self, mode: str):
+        label = self._fl_mode_warn_labels[mode]
+        problem = self._fl_inlet_problem(mode)
+        if problem:
+            label.setText(f"⚠ {problem}")
+            label.setStyleSheet("color:#ff6666; font-size:10px;")
+        else:
+            label.setText("OK")
+            label.setStyleSheet("color:#2ac555; font-size:10px;")
+
+    def _upconc_factor_values(self) -> list:
+        """[F1, F2, F3] from the Timing panel: float if valid (1-50),
+        None if blank, or the raw text if invalid."""
+        values = []
+        for le in self.upconc_factor_Inputs:
+            text = le.text().strip()
+            if not text:
+                values.append(None)
+                continue
+            try:
+                v = float(text)
+            except ValueError:
+                v = None
+            values.append(v if v is not None and 1.0 <= v <= 50.0 else text)
+        return values
+
+    def _update_factor_choice_labels(self):
+        """Show each factor's current value in the per-position drop-downs."""
+        if len(getattr(self, "upconc_factor_Inputs", [])) < 3:
+            return   # still building the Timing panel
+        for k, v in enumerate(self._upconc_factor_values()):
+            if isinstance(v, float):
+                text = f"F{k + 1} = {v:g}"
+            else:
+                text = f"F{k + 1} (unset)" if v is None else f"F{k + 1} (invalid)"
+            for combo in self.fl_position_factor_choice:
+                combo.setItemText(k, text)
+
+    def _fl_report_modes(self, pos_mode: dict):
+        """Push the per-position mode summary to the FL tab (thread-safe)."""
+        text = "Modes: " + "  |  ".join(
+            f"Pos {i + 1}: {pos_mode[i]}" for i in sorted(pos_mode))
+        self._exp_bridge.status_text_changed.emit("fl_mode", text)
+
+    def _fl_update_fluorescence(self, idx, raw_fl, mask, tick_number,
+                                time_tag_min, fluo_values, pos_mode,
+                                upconc_factors, fluo_csv):
+        """
+        Measure droplet fluorescence for one position, store it in
+        fluo_values as Fluo_Pos#_initial (tick 1) or Fluo_Pos#_##min, append
+        it to fluo_csv, and switch an addressed position (one in pos_mode)
+        from Upconcentration to Synthesis once
+        Fluo_Pos#_##min / Fluo_Pos#_initial exceeds that position's factor
+        in upconc_factors.
+        """
+        pos_num  = idx + 1
+        init_key = f"Fluo_Pos{pos_num}_initial"
+        key = init_key if tick_number == 1 else f"Fluo_Pos{pos_num}_{time_tag_min:.0f}min"
+
+        factor = upconc_factors.get(idx)   # None for unaddressed positions
+        result = droplet_fluorescence(raw_fl, mask)
+        if result is None:
+            print(f"  Pos {pos_num}: no droplet mask - {key} not measured")
+            return
+        fluo, med_in, med_out = result
+        fluo_values[key] = fluo
+
+        ratio = None
+        initial = fluo_values.get(init_key)
+        if tick_number > 1 and initial is not None:
+            if initial > 0:
+                ratio = fluo / initial
+            else:
+                print(f"  Pos {pos_num}: {init_key} = {initial:.1f} <= 0 - "
+                      f"cannot compute up-concentration ratio")
+
+        print(f"  Pos {pos_num}: {key} = {fluo:.1f}  "
+              f"(in {med_in:.1f} - out {med_out:.1f})"
+              + (f"  ratio {ratio:.2f}" if ratio is not None else "")
+              + (f" / factor {factor:g}" if ratio is not None and factor else ""))
+
+        if (ratio is not None and factor is not None and ratio > factor
+                and pos_mode.get(idx) == MODE_UPCONC):
+            pos_mode[idx] = MODE_SYNTH
+            self._fl_status(
+                f"Pos {pos_num} -> SYNTHESIS mode "
+                f"(ratio {ratio:.2f} > {factor:g})")
+            self._fl_report_modes(pos_mode)
+
+        with open(fluo_csv, "a", newline="") as f:
+            csv.writer(f).writerow([
+                key, pos_num, f"{time_tag_min:.0f}", f"{med_in:.2f}",
+                f"{med_out:.2f}", f"{fluo:.2f}",
+                "" if ratio is None else f"{ratio:.4f}",
+                "" if factor is None else factor,
+                pos_mode.get(idx, "not addressed"),
+            ])
+
+    def _fl_feed_droplet(self, rn, inlets, positions, flow_dur, drive_dur):
+        """Move to position rn, generate one droplet from `inlets` (one or a
+        legal pair, opened together) and drive it into chemostat rn+1,
+        recording the drive on the VideoThread."""
+        px, py, pz = positions[rn]
+        self.mmc.setTimeoutMs(30000)
+        self.mmc.setXYPosition(px, py)
+        self.mmc.waitForDevice(self.mmc.getXYStageDevice())
+        self.mmc.setPosition(pz)
+        self.mmc.waitForDevice(self.mmc.getFocusDevice())
+        self.mmc.setTimeoutMs(5000)
+        time.sleep(0.3)
+
+        gw = DropletWorker("generate", inlets=list(inlets), flow_duration=flow_dur)
+        gw.start(); gw.wait()
+
+        if self.video_thread and self.video_thread.isRunning():
+            self.video_thread.start_recording()
+        else:
+            print(f"WARNING: VideoThread not running at "
+                  f"position {rn+1} – skipping recording")
+            return
+
+        dw = DropletWorker(
+            "drive", inlets[0],
+            drive_duration=drive_dur,
+            chemostat_number=rn + 1,
+        )
+        dw.start(); dw.wait()
+
+        if self.video_thread and self.video_thread.isRunning():
+            self.video_thread.stop_recording()
+        QtCore.QThread.msleep(200)
+
+    def _fl_flush_buffer(self):
+        """Flush the buffer inlet after a feed step."""
+        self.open_inlet(self.Buffer_inlet)
+        self.control_valve(6,  state=False)
+        time.sleep(1)
+        self.close_inlet(self.Buffer_inlet)
+        self.control_valve(6,  state=True)
 
     def _start_fl_experiment(self, interval_min: int, total_min: int):
         """
@@ -2430,11 +2304,68 @@ class MicroscopeControlGUI(QMainWindow):
         if not self.selected_exposures:
             QMessageBox.warning(self, "No exposures",
                                 "Set at least one filter/exposure in the "
-                                "Timelapse Setup tab and click Save Values.")
+                                "FL Segmentation tab and click Save Values.")
             return
         if interval_min <= 0 or total_min <= 0:
             QMessageBox.warning(self, "Invalid timing",
                                 "Set a non-zero interval and total duration.")
+            return
+        factors = self._upconc_factor_values()
+        bad = [f"F{k + 1}" for k, v in enumerate(factors)
+               if v is not None and not isinstance(v, float)]
+        if factors[0] is None or bad:
+            QMessageBox.warning(self, "Invalid Up-concentration Factor",
+                                "F1 is required and every Up-concentration "
+                                "Factor that is filled in must be between "
+                                "1 and 50."
+                                + (f"\n\nInvalid: {', '.join(bad)}" if bad else ""))
+            return
+
+        # Feeding Modes table
+        problems = [f"{mode}: {self._fl_inlet_problem(mode)}"
+                    for mode in (MODE_UPCONC, MODE_SYNTH, MODE_MAINTAIN)
+                    if self._fl_inlet_problem(mode)]
+        if problems:
+            QMessageBox.warning(self, "Invalid inlets",
+                                "Fix the Feeding Modes inlets:\n\n"
+                                + "\n".join(problems))
+            return
+        mode_inlets = {mode: self._fl_mode_inlet_values(mode)
+                       for mode in (MODE_UPCONC, MODE_SYNTH, MODE_MAINTAIN)}
+
+        addressed = [p for p, cb in enumerate(self.fl_position_checks)
+                     if cb.isChecked()]
+        if not addressed:
+            QMessageBox.warning(self, "No positions addressed",
+                                "Tick at least one position in the Feeding "
+                                "Modes table.")
+            return
+        missing = [p + 1 for p in addressed if p >= len(self.positions)]
+        if missing:
+            answer = QMessageBox.question(
+                self, "Positions not saved",
+                f"Position(s) {', '.join(map(str, missing))} are ticked but "
+                f"only {len(self.positions)} stage position(s) are saved.\n"
+                f"They will be skipped. Continue?")
+            if answer != QMessageBox.Yes:
+                return
+            addressed = [p for p in addressed if p < len(self.positions)]
+            if not addressed:
+                return
+
+        # Up-concentration Factor per addressed position
+        upconc_factors = {}
+        unset = []
+        for p in addressed:
+            k = self.fl_position_factor_choice[p].currentIndex()
+            if factors[k] is None:
+                unset.append(f"Pos {p + 1} → F{k + 1}")
+            upconc_factors[p] = factors[k]
+        if unset:
+            QMessageBox.warning(self, "Up-concentration Factor not set",
+                                "These positions use a factor that is "
+                                "blank in the Timing panel:\n\n"
+                                + "\n".join(unset))
             return
 
         base      = self.directory_input.text().strip() or "."
@@ -2449,14 +2380,15 @@ class MicroscopeControlGUI(QMainWindow):
             # for why (the user can still click Save/Clear Position or Add
             # Step while this worker thread is running).
             list(self.positions), list(self.selected_exposures),
-            list(self.Chemostat_protocol_steps),
+            upconc_factors, mode_inlets, addressed,
         )
 
     def _run_fl_experiment_body(self, interval_min, total_min, base,
                                  purge_dur, flow_dur, drive_dur,
-                                 positions, selected_exposures, chemostat_steps):
+                                 positions, selected_exposures,
+                                 upconc_factors, mode_inlets, addressed):
         """
-        FL-segmentation timelapse — no SAM2, no pre-annotation required.
+        FL-segmentation timelapse — no pre-annotation required.
         Runs on a background ExperimentWorker thread (see _start_fl_experiment).
 
         Every `interval_min` minutes for `total_min` total minutes:
@@ -2467,9 +2399,21 @@ class MicroscopeControlGUI(QMainWindow):
           2. segment_droplet_fl() segments the droplet and measures its area.
              The segmentation overlay is saved alongside the TIFF for inspection.
           3. Initial area is recorded on the very first tick.
-          4. From tick 2 onwards, if area < AREA_THRESHOLD × initial:
-               – Chemostat protocol runs for that position.
-               – That position's loop counter increments.
+          4. Droplet fluorescence (median inside mask − median outside) is
+             recorded as Fluo_Pos#_initial on tick 1 and Fluo_Pos#_##min
+             afterwards, logged to <base>/fluorescence_upconcentration.csv.
+             Every addressed position starts in Upconcentration mode; once
+             Fluo_Pos#_##min / Fluo_Pos#_initial > its own factor
+             (upconc_factors, chosen per position from F1-F3) it switches
+             to Synthesis mode.
+          5. From tick 2 onwards, if an addressed position's
+             area < AREA_THRESHOLD × initial, it gets one droplet generated
+             from its current mode's inlets (mode_inlets; a pair is opened
+             together) and its loop counter increments:
+               – Upconcentration: Upconcentration inlets.
+               – Synthesis: Synthesis inlets once, then the position
+                 switches to Maintain for the rest of the experiment.
+               – Maintain: Maintain inlet.
 
         Folder / file naming
         ────────────────────
@@ -2484,7 +2428,8 @@ class MicroscopeControlGUI(QMainWindow):
         try:
             self._run_fl_experiment_body_inner(
                 interval_min, total_min, base, purge_dur, flow_dur, drive_dur,
-                positions, selected_exposures, chemostat_steps)
+                positions, selected_exposures,
+                upconc_factors, mode_inlets, addressed)
         except Exception:
             # Stop (ExperimentStopped) or a real failure mid-run: reset to a
             # known-safe state before propagating. Normal completion does
@@ -2495,13 +2440,30 @@ class MicroscopeControlGUI(QMainWindow):
 
     def _run_fl_experiment_body_inner(self, interval_min, total_min, base,
                                        purge_dur, flow_dur, drive_dur,
-                                       positions, selected_exposures, chemostat_steps):
+                                       positions, selected_exposures,
+                                       upconc_factors, mode_inlets, addressed):
         interval_sec = interval_min * 60
         total_sec    = total_min    * 60
 
-        # Per-position state — all local, no SAM2Manager needed
+        # Per-position state — all local
         initial_areas  = {}   # {idx: int px}  – recorded on tick 1
         pos_loop_count = {}   # {idx: int}      – completed loops (0 → Loop 1)
+        # Fluorescence values keyed "Fluo_Pos#_initial" / "Fluo_Pos#_##min"
+        fluo_values    = {}
+        # Mode of each addressed position (0-based idx); unaddressed
+        # positions are imaged and logged but never fed.
+        pos_mode       = {idx: MODE_UPCONC for idx in addressed}
+        self._fl_report_modes(pos_mode)
+
+        os.makedirs(base, exist_ok=True)
+        fluo_csv = os.path.join(base, "fluorescence_upconcentration.csv")
+        if not os.path.exists(fluo_csv):
+            with open(fluo_csv, "w", newline="") as f:
+                csv.writer(f).writerow([
+                    "name", "position", "time_min", "median_inside",
+                    "median_outside", "fluo", "ratio_to_initial",
+                    "upconc_factor", "mode",
+                ])
 
         # Initialise valves
         init_states = [
@@ -2586,13 +2548,18 @@ class MicroscopeControlGUI(QMainWindow):
 
                 # Segment and save overlay PNG for visual inspection
                 # e.g. Pos1_Loop2_filt3_30ms_6min_mask.png
-                _, seg_area, seg_overlay = segment_droplet_fl(raw_fl)
+                seg_mask, seg_area, seg_overlay = segment_droplet_fl(raw_fl)
                 overlay_fname = (
                     f"Pos{pos_num}_Loop{pos_loop}"
                     f"_filt{seg_filt}_{seg_exp}ms_{time_tag_str}_mask.png"
                 )
                 cv2.imwrite(os.path.join(fl_dir, overlay_fname), seg_overlay)
                 time.sleep(0.2)
+
+                # Droplet fluorescence → Upconcentration/Synthesis switch
+                self._fl_update_fluorescence(
+                    idx, raw_fl, seg_mask, tick_number, time_tag_min,
+                    fluo_values, pos_mode, upconc_factors, fluo_csv)
 
                 # Record initial area on the very first tick
                 if tick_number == 1:
@@ -2603,14 +2570,15 @@ class MicroscopeControlGUI(QMainWindow):
                     print(
                         f"  Pos {pos_num}  Loop {pos_loop}: "
                         f"area = {seg_area} px  ({ratio * 100:.1f}% of initial  "
-                        f"[threshold {SAM2Config.AREA_THRESHOLD * 100:.0f}%])"
+                        f"[threshold {FL_AREA_THRESHOLD * 100:.0f}%])"
                     )
-                    if initial > 0 and seg_area < SAM2Config.AREA_THRESHOLD * initial:
+                    if (idx in pos_mode and initial > 0
+                            and seg_area < FL_AREA_THRESHOLD * initial):
                         triggered_positions.append(idx)
                         self._fl_status(
                             f"⚠ Pos {pos_num} TRIGGERED "
                             f"({ratio * 100:.1f}% < "
-                            f"{SAM2Config.AREA_THRESHOLD * 100:.0f}%)"
+                            f"{FL_AREA_THRESHOLD * 100:.0f}%)"
                         )
 
             # ── no triggers this tick ─────────────────────────────────────────────
@@ -2670,20 +2638,16 @@ class MicroscopeControlGUI(QMainWindow):
 
             print(f"\n  ⚠ Triggered: {', '.join(names)}")
 
-            # ── chemostat protocol for triggered positions only ────────────
-            if chemostat_steps:
-                self._fl_status("Running chemostat for triggered positions …")
+            # ── feed triggered positions according to their current mode ───
+            # Each mode group: purge that mode's inlets once, then one droplet
+            # (inlets opened together) per triggered position, then flush.
+            # Synthesis is fed once, after which the position goes to Maintain.
+            if triggered_positions:
+                self._fl_status("Feeding triggered positions …")
 
                 self.open_inlet(self.Buffer_inlet)
                 time.sleep(2)
                 self.close_inlet(self.Buffer_inlet)
-
-
-                '''for inlet_range in range[1,9]:
-                    self.open_inlet(inlet_range)
-                    time.sleep(2)
-                    self.close_inlet(inlet_range)
-                self.control_valve(6, state=True)'''
 
                 self.mmc.setProperty(self.DIAlamp, "State", 1)
                 if self.video_thread is not None and self.video_thread.isRunning():
@@ -2693,59 +2657,37 @@ class MicroscopeControlGUI(QMainWindow):
                 self.video_thread.start()
                 QtCore.QThread.msleep(300)
 
-
                 # ── HOLD DROPLETS IN PLACE ────────────
                 send_to_arduino(2)
                 send_to_arduino(4)
 
-
-                for step in chemostat_steps:
+                for mode in (MODE_UPCONC, MODE_SYNTH, MODE_MAINTAIN):
+                    group_idx = [i for i in triggered_positions
+                                 if pos_mode[i] == mode]
+                    if not group_idx:
+                        continue
+                    inlets = mode_inlets[mode]
                     if self._experiment_stop_requested:
                         raise ExperimentStopped()
-                    i1    = step["input1"]
-                    i2    = step["input2"]
-                    rings = step["rings"]
 
-                    pw = DropletWorker("purge", inlets=[i1, i2], purge_duration=purge_dur)
+                    pw = DropletWorker("purge", inlets=inlets, purge_duration=purge_dur)
                     pw.start(); pw.wait()
 
-                    for rn, active in enumerate(rings):
-                        if active and (rn in triggered_positions):
-                            px, py, pz = positions[rn]
-                            self.mmc.setTimeoutMs(30000)
-                            self.mmc.setXYPosition(px, py)
-                            self.mmc.waitForDevice(self.mmc.getXYStageDevice())
-                            self.mmc.setPosition(pz)
-                            self.mmc.waitForDevice(self.mmc.getFocusDevice())
-                            self.mmc.setTimeoutMs(5000)
-                            time.sleep(0.3)
+                    for rn in group_idx:
+                        if self._experiment_stop_requested:
+                            raise ExperimentStopped()
+                        self._fl_status(
+                            f"{mode} feed – Pos {rn + 1}  "
+                            f"inlet(s) {'+'.join(map(str, inlets))}")
+                        self._fl_feed_droplet(rn, inlets, positions,
+                                              flow_dur, drive_dur)
+                        if mode == MODE_SYNTH:
+                            pos_mode[rn] = MODE_MAINTAIN
+                            print(f"  Pos {rn + 1}: synthesis feed done "
+                                  f"-> MAINTAIN mode")
 
-                            gw = DropletWorker("generate", inlets=[i1], flow_duration=flow_dur)
-                            gw.start(); gw.wait()
-
-                            if self.video_thread and self.video_thread.isRunning():
-                                self.video_thread.start_recording()
-                            else:
-                                print(f"WARNING: VideoThread not running at "
-                                      f"position {rn+1} – skipping recording")
-                                continue
-
-                            dw = DropletWorker(
-                                "drive", i1,
-                                drive_duration=drive_dur,
-                                chemostat_number=rn + 1,
-                            )
-                            dw.start(); dw.wait()
-
-                            if self.video_thread and self.video_thread.isRunning():
-                                self.video_thread.stop_recording()
-                            QtCore.QThread.msleep(200)
-
-                    self.open_inlet(self.Buffer_inlet)
-                    self.control_valve(6,  state=False)
-                    time.sleep(1)
-                    self.close_inlet(self.Buffer_inlet)
-                    self.control_valve(6,  state=True)
+                    self._fl_flush_buffer()
+                self._fl_report_modes(pos_mode)
 
                 self.video_thread.stop()
                 self.video_thread = None
@@ -2755,8 +2697,6 @@ class MicroscopeControlGUI(QMainWindow):
                 self.control_valve(11, state=True)
                 send_to_arduino(4)
                 send_to_arduino(3)
-                
-
 
             # ── increment loop counters for triggered positions ───────────
             for idx in triggered_positions:
@@ -2772,680 +2712,9 @@ class MicroscopeControlGUI(QMainWindow):
         print("\n=== FL-segmentation timelapse complete ===")
         self._fl_status("Experiment complete.")
 
-    def _sam2_status(self, msg: str):
-        """Update the SAM2 status label and print to console."""
-        print(f"[SAM2] {msg}")
-        if hasattr(self, "sam2_status_label"):
-            # Emitted through the bridge - see _fl_status for why.
-            self._exp_bridge.status_text_changed.emit("sam2", f"Status: {msg}")
-
-
-    # ── 1. SAM2 tab builder ─────────────────────────────────────────────────────
-    def _build_sam2_panel(self, parent_layout):
-        """Build the SAM2 controls tab (called from __init__)."""
-        info = QLabel(
-            "① Capture one initial BF image per position (pre-experiment).\n"
-            "② Annotate each image with SAM2 (live point-click preview).\n"
-            "③ Start the SAM2-tracked timelapse.\n\n"
-            f"Chemostat fires when a droplet shrinks below "
-            f"{SAM2Config.AREA_THRESHOLD * 100:.0f}% of its initial area.\n"
-            "Each position tracks its own loop counter independently.\n"
-            "Use the Timing panel to set imaging interval and total duration."
-        )
-        info.setStyleSheet("color:#aaa; font-size:12px;")
-        info.setWordWrap(True)
-        parent_layout.addWidget(info)
-
-        buttons = [
-            ("① Capture initial BF for all positions",     BTN_BLUE,
-            lambda: self.capture_bf_for_all_positions()),
-            ("② Annotate all positions with SAM2",         BTN_BLUE,
-            lambda: self.annotate_all_positions_sam2()),
-            ("③ Start SAM2-tracked timelapse experiment",  BTN_GREEN,
-            lambda: self._start_sam2_experiment(
-                interval_min=int(self.cycle_Interval_Input.text()),
-                total_min=int(self.cycle_Input.text()),
-            )),
-        ]
-        self.sam2_step_buttons = []
-        for label, style, slot in buttons:
-            btn = QPushButton(label)
-            btn.setStyleSheet(style)
-            btn.setMinimumHeight(36)
-            btn.clicked.connect(slot)
-            parent_layout.addWidget(btn)
-            self.sam2_step_buttons.append(btn)
-
-        self.sam2_status_label = QLabel("Status: idle")
-        self.sam2_status_label.setStyleSheet("color:#ffcc44; font-size:11px;")
-        parent_layout.addWidget(self.sam2_status_label)
-        parent_layout.addStretch()
-
-
-    # ── 2. Step ①: capture initial BF images ───────────────────────────────────
-    def capture_bf_for_all_positions(self):
-        """
-        For every saved stage position:
-        • Move the stage to that position.
-        • Snap one BF image.
-        • Save as  <base>/Position_<N>/BF/PosN_initialBF.tiff
-        Paths are stored in sam2_mgr for the annotation step.
-        """
-        if not self.positions:
-            QMessageBox.warning(self, "No positions",
-                                "Save at least one stage position first.")
-            return
-
-        base = self.directory_input.text().strip() or "."
-        self.sam2_mgr.base_dir = base
-
-        self.DIALamp_activate()
-
-        for idx, (px, py, pz) in enumerate(self.positions):
-            pos_num = idx + 1
-            bf_dir  = os.path.join(base, f"Position_{pos_num}", "BF")
-            os.makedirs(bf_dir, exist_ok=True)
-
-            self._sam2_status(f"Moving to position {pos_num} …")
-            self.mmc.setXYPosition(px, py)
-            self.mmc.setPosition(pz)
-            self.mmc.waitForSystem()
-            time.sleep(0.6)
-
-            self._sam2_status(f"Snapping initial BF for position {pos_num} …")
-            
-            raw_arr = self.snap_DIA_image()
-
-            save_path = os.path.join(bf_dir, f"Pos{pos_num}_initialBF.tiff")
-            tiff.imwrite(save_path, raw_arr)
-
-            # Initialise per-position state
-            self.sam2_mgr.ref_image_path[idx] = save_path
-            self.sam2_mgr.loop_bf_paths[idx]  = []
-            self.sam2_mgr.pos_loop_count[idx] = 0
-
-            self._sam2_status(f"Pos {pos_num}: saved → {save_path}")
-
-        self._sam2_status("Initial BF capture complete for all positions.")
-        self.DIALamp_deactivate()
-        QMessageBox.information(
-            self, "Done",
-            "Initial BF images captured for all positions.\n"
-            "Proceed to Step ② to annotate.",
-        )
-
-
-    # ── 3. Step ②: SAM2 annotation ─────────────────────────────────────────────
-    def annotate_all_positions_sam2(self):
-        """
-        For each position, open the initial BF image in a matplotlib window.
-        The user annotates the droplet; the mask is saved as:
-            <base>/Position_<N>/BF/PosN_initialMask.tiff
-        and stored in sam2_mgr.ref_mask[idx].
-        """
-        if not self.sam2_mgr.ref_image_path:
-            QMessageBox.warning(self, "No BF images",
-                                "Capture initial BF images first (Step ①).")
-            return
-
-        self.sam2_mgr.load_predictor()
-
-        for idx in sorted(self.sam2_mgr.ref_image_path):
-            pos_num  = idx + 1
-            img_path = self.sam2_mgr.ref_image_path[idx]
-            bf_dir   = os.path.dirname(img_path)
-
-            self._sam2_status(
-                f"Annotate Pos {pos_num} – click droplet, press Enter to accept …"
-            )
-
-            gray = SAM2Manager.load_gray_uint8(img_path)
-
-            # Build a single-frame SAM2 state purely for the annotation window
-            tmp_dir = os.path.join(
-                self.sam2_mgr.base_dir, f"_sam2_annotate_tmp_pos{idx}"
-            )
-            SAM2Manager.write_sam2_frame_folder([img_path], tmp_dir)
-            state = self.sam2_mgr.predictor.init_state(video_path=tmp_dir)
-
-            mask = self.sam2_mgr.annotate_frame_interactive(gray, state)
-            self.sam2_mgr.ref_mask[idx]    = mask
-            self.sam2_mgr.initial_area[idx] = int(mask.sum())
-
-            mask_path = os.path.join(bf_dir, f"Pos{pos_num}_initialMask.tiff")
-            tiff.imwrite(mask_path, mask.astype(np.uint8))
-
-            self._sam2_status(
-                f"Pos {pos_num} annotated – initial area = {mask.sum()} px"
-            )
-
-        self._sam2_status("All positions annotated. Ready for Step ③.")
-        QMessageBox.information(self, "Done",
-                                "All positions annotated. Ready to start.")
-
-
-    # ── 4. Steps 3-6: SAM2-tracked timelapse ────────────────────────────────────
-    def _start_sam2_experiment(self, interval_min: int, total_min: int):
-        """
-        GUI-thread entry point for the SAM2-tracked timelapse: does the
-        validation (QMessageBox dialogs are not safe from a worker thread)
-        and snapshots widget/shared-state reads into plain locals, then
-        hands off to _run_sam2_experiment_body on a background
-        ExperimentWorker. See _run_sam2_experiment_body's docstring for
-        what the experiment actually does.
-
-        self.sam2_mgr itself is NOT snapshotted (it's a stateful GPU/SAM2
-        manager object - ref_mask, pos_loop_count, initial_area, the
-        predictor - that can't be meaningfully copied); the run body keeps
-        reading/writing it directly. Avoid re-annotating positions or
-        recapturing BF images while a SAM2 experiment is running.
-        """
-        if not self.sam2_mgr.ref_mask:
-            QMessageBox.warning(self, "Not annotated",
-                                "Complete Steps ① and ② before starting.")
-            return
-        if not self.positions:
-            QMessageBox.warning(self, "No positions", "No stage positions saved.")
-            return
-
-        if interval_min <= 0 or total_min <= 0:
-            QMessageBox.warning(self, "Invalid timing",
-                                "Set a non-zero interval and total duration before starting.")
-            return
-
-        base = self.directory_input.text().strip() or "."
-        self.sam2_mgr.base_dir = base
-
-        purge_dur = float(self.purge_duration_Input.text())
-        flow_dur  = float(self.flow_duration_Input.text())
-        drive_dur = float(self.drive_duration_Input.text())
-
-        self._launch_experiment_worker(
-            self._run_sam2_experiment_body,
-            interval_min, total_min, base, purge_dur, flow_dur, drive_dur,
-            # Snapshot into fresh lists - see the fallback path's launch
-            # for why (the user can still click Save/Clear Position or Add
-            # Step while this worker thread is running).
-            list(self.positions), list(self.selected_exposures),
-            list(self.Chemostat_protocol_steps),
-        )
-
-    def _run_sam2_experiment_body(self, interval_min, total_min, base,
-                                   purge_dur, flow_dur, drive_dur,
-                                   positions, selected_exposures, chemostat_steps):
-        """
-        Time-driven timelapse with per-position SAM2 tracking. Runs on a
-        background ExperimentWorker thread (see _start_sam2_experiment).
-
-        Parameters
-        ----------
-        interval_min : int  – minutes between imaging rounds (e.g. 3)
-        total_min    : int  – total experiment duration in minutes (e.g. 120)
-
-        Loop structure
-        ──────────────
-        Every `interval_min` minutes:
-        [Step 3]  BF-image ALL positions and measure droplet area via SAM2.
-                    SAM2 context for position P = [initial_BF] +
-                    [all BF images taken in P's *current* loop so far].
-                    Append the new BF to P's current-loop context.
-                    Save the new BF image and its SAM2 mask.
-
-        [Step 4]  Identify positions where area < AREA_THRESHOLD × initial.
-
-        [Step 5]  FL imaging of triggered positions only.
-
-        [Step 6]  Chemostat protocol for triggered positions only.
-                    After chemostat:
-                    • Reset that position's loop-BF list (context → initial only).
-                    • Increment that position's loop counter.
-        """
-        try:
-            self._run_sam2_experiment_body_inner(
-                interval_min, total_min, base, purge_dur, flow_dur, drive_dur,
-                positions, selected_exposures, chemostat_steps)
-        except Exception:
-            # Stop (ExperimentStopped) or a real failure mid-run: reset to a
-            # known-safe state before propagating. Normal completion does
-            # NOT go through here - it has its own deliberate final
-            # valve-0 state at the end, which this must not stomp on.
-            self._safe_shutdown_valves()
-            raise
-
-    def _run_sam2_experiment_body_inner(self, interval_min, total_min, base,
-                                         purge_dur, flow_dur, drive_dur,
-                                         positions, selected_exposures, chemostat_steps):
-        interval_sec = interval_min * 60
-        total_sec    = total_min    * 60
-
-        # ── Initialise valve state (identical to original TimeLapse_Experiment) ──
-        init_states = [
-            (0, False), (1, True),  (2, False), (3, True),  (4, True),  (5, False),
-            (6, False), (7, True),  (8, False), (9, False),  (10, False), (11, False),
-            (12, True), (13, True), (14, True), (15, True),
-        ]
-        for v, s in init_states:
-            self.control_valve(v, state=s)
-
-        experiment_start = time.time()
-        tick_number      = 0   # counts how many imaging rounds have been done
-
-        self._sam2_status(
-            f"Experiment started – interval {interval_min} min / "
-            f"total {total_min} min"
-        )
-        print(f"\n{'='*62}")
-        print(f"  SAM2 TIMELAPSE  |  interval {interval_min} min  "
-            f"|  total {total_min} min")
-        print(f"{'='*62}")
-
-        # ── outer timing loop ────────────────────────────────────────────────────
-        while True:
-            now               = time.time()
-            elapsed_sec       = now - experiment_start
-
-            # Stop when total time is reached
-            if elapsed_sec >= total_sec:
-                break
-
-            # Sleep until the next tick is due
-            next_due_sec = tick_number * interval_sec
-            wait_for     = next_due_sec - elapsed_sec
-            if wait_for > 0:
-                self._sam2_status(
-                    f"Waiting {wait_for:.0f} s until next imaging round …"
-                )
-                self._check_stop_and_sleep_chunked(wait_for)
-
-            # ── start of one imaging round ───────────────────────────────────────
-            tick_number         += 1
-            tick_wall_start      = time.time()
-            elapsed_min          = (tick_wall_start - experiment_start) / 60.0
-
-            # Round the elapsed time to the nearest interval for the filename tag
-            # e.g. at 3.02 min with interval=3  →  "3min"
-            time_tag_min  = round(elapsed_min / interval_min) * interval_min
-            time_tag_str  = f"{time_tag_min:.0f}min"
-
-            print(f"\n{'─'*62}")
-            print(f"  Tick {tick_number}  |  ~{time_tag_min:.0f} min elapsed")
-            print(f"{'─'*62}")
-
-            triggered_positions = []   # positions whose area fell below threshold
-
-            self.DIALamp_activate()
-
-            # ── Step 3: BF image every position, measure area ────────────────────
-            for idx, (px, py, pz) in enumerate(positions):
-                if self._experiment_stop_requested:
-                    raise ExperimentStopped()
-                pos_num  = idx + 1
-                # pos_loop is the 1-based loop label shown in filenames
-                pos_loop = self.sam2_mgr.pos_loop_count.get(idx, 0) + 1
-                initial  = self.sam2_mgr.initial_area.get(idx, 0)
-
-                bf_dir = os.path.join(base, f"Position_{pos_num}", "BF")
-                os.makedirs(bf_dir, exist_ok=True)
-
-                # e.g.  Pos1_Loop3_BF_6min.tiff
-                bf_fname = f"Pos{pos_num}_Loop{pos_loop}_BF_{time_tag_str}.tiff"
-                bf_path  = os.path.join(bf_dir, bf_fname)
-
-                self._sam2_status(
-                    f"BF snap – Pos {pos_num}  Loop {pos_loop}  @ {time_tag_str}"
-                )
-                self.mmc.setTimeoutMs(30000)
-                self.mmc.setXYPosition(px, py)
-                self.mmc.waitForDevice(self.mmc.getXYStageDevice())
-                self.mmc.setPosition(pz)
-                self.mmc.waitForDevice(self.mmc.getFocusDevice())
-                time.sleep(0.3)
-
-                raw_arr = self.snap_DIA_image()
-                tiff.imwrite(bf_path, raw_arr)
-
-                # ── SAM2 area measurement ─────────────────────────────────────────
-                if idx not in self.sam2_mgr.ref_mask:
-                    print(f"  Pos {pos_num}: no reference mask, skipping SAM2.")
-                    continue
-
-                mask, area = self.sam2_mgr.measure_area_with_context(idx, bf_path)
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                # Save the SAM2 mask for this time-point
-                # e.g.  Pos1_Loop3_mask_6min.tiff
-                mask_fname = (
-                    f"Pos{pos_num}_Loop{pos_loop}_mask_{time_tag_str}.tiff"
-                )
-                tiff.imwrite(os.path.join(bf_dir, mask_fname),
-                            mask.astype(np.uint8))
-
-                # Append this BF to the current-loop context for future ticks
-                self.sam2_mgr.append_loop_bf(idx, bf_path)
-
-                ratio = area / initial if initial > 0 else 1.0
-                print(
-                    f"  Pos {pos_num}  Loop {pos_loop}: "
-                    f"area = {area} px  ({ratio * 100:.1f}% of initial  "
-                    f"[threshold {SAM2Config.AREA_THRESHOLD * 100:.0f}%])"
-                )
-
-                if initial > 0 and area < SAM2Config.AREA_THRESHOLD * initial:
-                    triggered_positions.append(idx)
-                    self._sam2_status(
-                        f"⚠ Pos {pos_num} TRIGGERED "
-                        f"({ratio * 100:.1f}% < "
-                        f"{SAM2Config.AREA_THRESHOLD * 100:.0f}%)"
-                    )
-
-            self.DIALamp_deactivate()
-            
-            # ── Step 4: report triggered positions ──────────────────────────────
-            if not triggered_positions:
-                print("  ✓ All droplets within acceptable size.")
-                self._sam2_status(
-                    f"Tick {tick_number}: all areas OK. "
-                    f"Next tick in ~{interval_min} min."
-                )
-                continue   # no FL imaging or chemostat needed this round
-
-            names = [f"Pos {i + 1}" for i in triggered_positions]
-            print(f"\n  ⚠ Triggered this tick: {', '.join(names)}")
-
-            # ── Step 5: FL imaging of triggered positions only ───────────────────
-            if selected_exposures:
-                for idx in triggered_positions:
-                    if self._experiment_stop_requested:
-                        raise ExperimentStopped()
-                    pos_num  = idx + 1
-                    pos_loop = self.sam2_mgr.pos_loop_count.get(idx, 0) + 1
-
-                    fl_dir = os.path.join(base, f"Position_{pos_num}", "FL")
-                    os.makedirs(fl_dir, exist_ok=True)
-
-                    self._sam2_status(
-                        f"FL imaging – Pos {pos_num}  Loop {pos_loop}"
-                    )
-                    px, py, pz = positions[idx]
-                    self.mmc.setTimeoutMs(30000)
-                    self.mmc.setXYPosition(px, py)
-                    self.mmc.waitForDevice(self.mmc.getXYStageDevice())
-                    self.mmc.setPosition(pz)
-                    self.mmc.waitForDevice(self.mmc.getFocusDevice())
-                    time.sleep(0.3)
-
-                    for filt, exp in selected_exposures:
-                        raw_fl = self.snap_EPI_image(filt, exp)
-                        # e.g.  Pos1_Loop3_filt1_100ms_6min.tiff
-                        fl_fname = (
-                            f"Pos{pos_num}_Loop{pos_loop}"
-                            f"_filt{filt}_{exp}ms_{time_tag_str}.tiff"
-                        )
-                        tiff.imwrite(os.path.join(fl_dir, fl_fname), raw_fl)
-                        time.sleep(0.2)
-
-            # ── Step 6: chemostat protocol for triggered positions only ──────────
-            if chemostat_steps:
-                self._sam2_status(
-                    "Running chemostat for triggered positions …"
-                )
-
-                # Valve priming sequence (identical to original experiment)
-                self.control_valve(15, state=False)
-                time.sleep(10)
-                self.control_valve(15, state=True)
-                self.control_valve(7,  state=False)
-                for v in [12, 13, 14, 15]:
-                    self.control_valve(v, state=False)
-                    time.sleep(5)
-                    self.control_valve(v, state=True)
-                self.control_valve(7, state=True)
-
-                self.mmc.setProperty(self.DIAlamp, "State", 1)
-                # FIX: stop any leftover thread from a previous loop iteration
-                # before creating a new one, preventing camera resource conflicts
-                if self.video_thread is not None and self.video_thread.isRunning():
-                    self.video_thread.stop()
-                    self.video_thread = None
-
-                self.video_thread = VideoThread()
-                self.video_thread.start()
-                # Give the acquisition pipeline a moment to initialise before
-                # the first start_recording() call
-                QtCore.QThread.msleep(300)
-
-                for step in chemostat_steps:
-                    if self._experiment_stop_requested:
-                        raise ExperimentStopped()
-                    i1    = step["input1"]
-                    i2    = step["input2"]
-                    rings = step["rings"]   # list[bool], one entry per position
-
-                    # Purge inlet once per step (not once per position)
-                    pw = DropletWorker("purge", inlets=[i1, i2], purge_duration=purge_dur)
-                    pw.start(); pw.wait()
-
-                    for rn, active in enumerate(rings):
-                        # Only act if the ring is checked AND this pos was triggered
-                        if active and (rn in triggered_positions):
-                            px, py, pz = positions[rn]
-                            self.mmc.setTimeoutMs(30000)
-                            self.mmc.setXYPosition(px, py)
-                            self.mmc.waitForDevice(self.mmc.getXYStageDevice())
-                            self.mmc.setPosition(pz)
-                            self.mmc.waitForDevice(self.mmc.getFocusDevice())
-                            time.sleep(0.3)
-
-                            gw = DropletWorker(
-                                "generate", inlets=[i1], flow_duration=flow_dur
-                            )
-                            gw.start(); gw.wait()
-                            # FIX: guard against a dead video thread before recording
-                            if self.video_thread and self.video_thread.isRunning():
-                                self.video_thread.start_recording()
-                            else:
-                                print(f"WARNING: VideoThread not running at loop "
-                                      f"step {rn+1} – skipping recording for this chemostat")
-                                continue
-
-                            dw = DropletWorker(
-                                "drive", i1,
-                                drive_duration=drive_dur,
-                                chemostat_number=rn + 1,
-                            )
-                            dw.start(); dw.wait()
-                            # FIX: always stop recording in a finally block so a
-                            # DropletWorker failure can't leave the writer open
-                            if self.video_thread and self.video_thread.isRunning():
-                                self.video_thread.stop_recording()
-                            # Brief pause to let the writer flush before the next clip
-                            QtCore.QThread.msleep(200)
-
-
-                    # Close / re-open flush valves between steps
-                    self.open_inlet(self.Buffer_inlet)
-                    self.control_valve(6,  state=False)
-                    time.sleep(1)
-                    self.close_inlet(self.Buffer_inlet)
-                    self.control_valve(6,  state=True)
-
-                self.video_thread.stop()
-                self.video_thread = None
-                self.mmc.setProperty(self.DIAlamp, "State", 0)
-
-            # ── Reset SAM2 context and advance loop counter per triggered pos ────
-            for idx in triggered_positions:
-                self.sam2_mgr.reset_loop_context(idx)
-                self.sam2_mgr.pos_loop_count[idx] = (
-                    self.sam2_mgr.pos_loop_count.get(idx, 0) + 1
-                )
-                new_loop = self.sam2_mgr.pos_loop_count[idx] + 1
-                print(
-                    f"  Pos {idx + 1}: SAM2 context reset → "
-                    f"entering Loop {new_loop}"
-                )
-
-        # ── Experiment complete ──────────────────────────────────────────────────
-        self.control_valve(0, state=True)
-        print("\n=== SAM2 timelapse experiment complete ===")
-        self._sam2_status("Experiment complete.")
-
-
-
-
-    # ── timelapse experiment ──────────────────
-    def TimeLapse_Experiment(self, num_loops, time_interval, positions_table,
-                              selected_exposures, chemostat_protocol_table):
-        try:
-            self._TimeLapse_Experiment_body(
-                num_loops, time_interval, positions_table,
-                selected_exposures, chemostat_protocol_table)
-        except Exception:
-            # Stop (ExperimentStopped) or a real failure mid-run: reset to a
-            # known-safe state before propagating so ExperimentWorker can
-            # log it. Normal completion does NOT go through here - it has
-            # its own deliberate final valve-0 state at the end of the body,
-            # which this must not stomp on.
-            self._safe_shutdown_valves()
-            raise
-
-    def _TimeLapse_Experiment_body(self, num_loops, time_interval, positions_table,
-                                    selected_exposures, chemostat_protocol_table):
-
-        # Initialise valves
-        init_states = [
-            (0, True), (1, True),  (2, True), (3, True),  (4, True),  (5, True),
-            (6, True), (7, False),  (8, True), (9, True), (10, False), (11, True),
-            (12, False), (13, False), (14, False), (15, False), (16, False), (17, False),
-        ]
-        for v, s in init_states:
-            self.control_valve(v, state=s)
-
-        purge_duration = float(self.purge_duration_Input.text())
-        flow_duration  = float(self.flow_duration_Input.text())
-        drive_duration = float(self.drive_duration_Input.text())
-
-        for loop in range(num_loops):
-            print(f"--- Loop {loop+1}/{num_loops} ---")
-            loop_start = time.time()
-
-            for ci in range(len(positions_table)):
-                self.mmc.setXYPosition(positions_table[ci][0], positions_table[ci][1])
-                self.mmc.setPosition(positions_table[ci][2])
-                self.mmc.waitForSystem(); time.sleep(0.5)
-                for filt, exp in selected_exposures:
-                    img = self.snap_EPI_image(filt, exp)
-                    fn  = f"Expt_{ci+1}_{filt}_{exp}_{loop+1}.tiff"
-                    time.sleep(0.2)
-                    tiff.imwrite(os.path.join(".", fn), img)
-
-            if self.Chemostat_protocol_steps:
-                self.open_inlet(self.Buffer_inlet)
-                time.sleep(2)
-                self.close_inlet(self.Buffer_inlet)
-                self.mmc.setProperty(self.DIAlamp, "State", 1)
-                if self.video_thread is not None and self.video_thread.isRunning():
-                    self.video_thread.stop()
-                    self.video_thread = None
-                self.video_thread = VideoThread()
-                self.video_thread.start()
-                QtCore.QThread.msleep(300)
-
-                for step in self.Chemostat_protocol_steps:
-                    send_to_arduino(2)
-                    send_to_arduino(4)
-                    i1 = step["input1"]; i2 = step["input2"]
-                    pw = DropletWorker("purge", inlets=[i1, i2], purge_duration=purge_duration)
-                    pw.start(); pw.wait()
-                    for rn, active in enumerate(step["rings"]):
-                        if active:
-                            self.mmc.setXYPosition(positions_table[rn][0], positions_table[rn][1])
-                            self.mmc.setPosition(positions_table[rn][2])
-                            gw = DropletWorker("generate", inlets=[i1], flow_duration=flow_duration)
-                            gw.start(); gw.wait()
-                            self.video_thread.start_recording()
-                            dw = DropletWorker("drive", i1, drive_duration=drive_duration, chemostat_number=rn+1)
-                            dw.start(); dw.wait()
-                            if self.video_thread and self.video_thread.isRunning():
-                                self.video_thread.stop_recording()
-                            # Brief pause to let the writer flush before the next clip
-                            QtCore.QThread.msleep(200)
-
-
-                    # Close / re-open flush valves between steps
-                    self.open_inlet(self.Buffer_inlet)
-                    self.control_valve(6,  state=False)
-                    time.sleep(1)
-                    self.close_inlet(self.Buffer_inlet)
-                    self.control_valve(6,  state=True)
-                    
-                self.video_thread.stop()
-                self.video_thread = None
-                self.mmc.setProperty(self.DIAlamp, "State", 0)
-
-                self.control_valve(11, state=True)
-                send_to_arduino(4)
-                send_to_arduino(3)
-
-
-            elapsed   = time.time() - loop_start
-            remaining = time_interval * 60 - elapsed
-            if remaining > 0:
-                print(f"Waiting {remaining:.1f}s …")
-                self._check_stop_and_sleep_chunked(remaining)
-
-        self.mmc.setTimeoutMs(5000)  # restore default
-        self._sam2_status("Experiment complete.")
-        self.control_valve(0, state=True)
-
-
-
-
-    # ── 5. Dispatcher: replaces the original start-button connection ─────────────
-    def _on_start_experiment(self):
-        """
-        Dispatch to the correct experiment mode based on which tab the user
-        has set up:
-          • FL Segmentation  – if the active tab is 'FL Segmentation'
-          • SAM2 Tracking    – if SAM2 reference masks have been annotated
-          • Original timelapse – fallback
-
-        Wire up in __init__:
-            self.start_experiment_button.clicked.connect(self._on_start_experiment)
-        """
-        self._stop_live_video()
-        active_tab = self.tabs.tabText(self.tabs.currentIndex())
-        if active_tab == "FL Segmentation":
-            self._start_fl_experiment(
-                interval_min=int(self.cycle_Interval_Input.text()),
-                total_min=int(self.cycle_Input.text()),
-            )
-        elif self.sam2_mgr.ref_mask:
-            self._start_sam2_experiment(
-                interval_min=int(self.cycle_Interval_Input.text()),
-                total_min=int(self.cycle_Input.text()),
-            )
-        else:
-            self._launch_experiment_worker(
-                self.TimeLapse_Experiment,
-                num_loops=int(self.cycle_Input.text()),
-                time_interval=int(self.cycle_Interval_Input.text()),
-                # Snapshot into fresh lists rather than sharing the live
-                # attributes directly - the user can still click
-                # Save/Clear Position or Add Step while this worker thread
-                # is running, which would otherwise mutate the same list
-                # the worker is iterating over.
-                positions_table=list(self.positions),
-                selected_exposures=list(self.selected_exposures),
-                chemostat_protocol_table=list(self.Chemostat_protocol_steps),
-            )
-
     def _launch_experiment_worker(self, target, *args, **kwargs):
         """
-        Shared launch path for every experiment entry point (the main Start
-        Experiment button's three modes, and each tab's own Start button):
+        Shared launch path for the FL experiment's Start button:
         guards against starting a second experiment while one is already
         running, resets the stop flag, flips Start/Stop button state, and
         runs `target(*args, **kwargs)` on a background ExperimentWorker so
@@ -3467,22 +2736,23 @@ class MicroscopeControlGUI(QMainWindow):
     def _set_experiment_controls_enabled(self, enabled: bool):
         """
         Enable/disable every control that would race a running
-        ExperimentWorker if clicked mid-run: the three experiment entry
-        points (so a second experiment can't be started concurrently),
+        ExperimentWorker if clicked mid-run: the FL experiment
+        entry point (so a second experiment can't be started concurrently),
         Live/Record (self.video_thread is shared with the worker), and the
-        position/exposure/chemostat-step editing controls (editing them
+        position/exposure/timing/feeding-mode editing controls (editing them
         mid-run wouldn't affect the already-snapshotted running worker, but
         would misleadingly suggest it does).
         """
-        self.start_experiment_button.setEnabled(enabled)
         self.stop_experiment_button.setEnabled(not enabled)
         for widget in (
             self.fl_start_button, self.live_Button, self.record_button,
+            self.quick_fl_snap_button,
             self.save_Position_button, self.replacePositionButton,
             self.clearButton, self.GoToPositionButton, self.Save_Exposures_button,
+            self.fl_mode_table, *self.upconc_factor_Inputs, self.Exposures_table,
+            self.cycle_Interval_Input, self.cycle_Input,
+            self.directory_input, self.browse_button,
         ):
-            widget.setEnabled(enabled)
-        for widget in self.sam2_step_buttons:
             widget.setEnabled(enabled)
 
     @pyqtSlot()
@@ -3513,47 +2783,3 @@ if __name__ == '__main__':
     app.setStyleSheet(WIDGET_STYLE)
     window = MicroscopeControlGUI()
     sys.exit(app.exec_())
-
-
-
-"""EXPERIMENT LOGIC OVERVIEW
-─────────────────────────
-Pre-experiment (manual, before clicking Start):
-①  capture_bf_for_all_positions()   – snap & save one BF per position
-②  annotate_all_positions_sam2()    – interactive SAM2 point annotation
-
-Experiment (_start_sam2_experiment / _run_sam2_experiment_body):
-• Every `interval_min` minutes, BF-image ALL positions.
-• Each position keeps its own independent loop counter.
-• SAM2 context for position P at time T in loop L =
-        [initial_BF]  +  [all BF images taken in loop L before time T]
-    → the initial BF is always frame 0; current-loop BFs accumulate on top.
-• If area < 70 % of initial  →  position is "triggered":
-        – FL imaging for that position (saved to Position_N/FL/)
-        – Chemostat protocol for that position
-        – Current-loop BF list reset (context back to initial only)
-        – That position's loop counter incremented by 1
-• Experiment ends when total wall-clock time is reached.
-
-FOLDER / FILE NAMING
-─────────────────────
-<base>/
-Position_1/
-    BF/
-    Pos1_initialBF.tiff
-    Pos1_initialMask.tiff
-    Pos1_Loop1_BF_3min.tiff        ← first tick, loop 1
-    Pos1_Loop1_mask_3min.tiff
-    Pos1_Loop1_BF_6min.tiff        ← triggered here
-    Pos1_Loop1_mask_6min.tiff
-    Pos1_Loop2_BF_3min.tiff        ← context reset, loop 2 begins
-    Pos1_Loop2_mask_3min.tiff
-    …
-    FL/
-    Pos1_Loop1_filt1_100ms_6min.tiff
-    Pos1_Loop2_filt2_50ms_21min.tiff
-    …
-Position_2/
-    BF/  …
-    FL/  …
-"""
