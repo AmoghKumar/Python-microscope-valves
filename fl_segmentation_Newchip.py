@@ -92,6 +92,7 @@ FILTER_BUTTON_COLORS = {
     6: ("#d8d8d2", "black"),   # DIA        – white transmitted light
 }
 BTN_PURPLE = "background-color: #6a3db8; color: white; border-radius: 4px; padding: 4px 8px;"
+BTN_BLUE   = BTN_GREY   # old name; blue buttons are now grey
 
 LABEL_BOLD = "font-weight: bold; color: #cccccc;"
 GROUP_STYLE = """
