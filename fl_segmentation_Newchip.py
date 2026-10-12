@@ -1,4 +1,5 @@
 import os
+import math
 import time
 import traceback
 from pymmcore_plus import CMMCorePlus
@@ -7,7 +8,7 @@ from PyQt5.QtWidgets import (
     QRadioButton, QFrame, QSpinBox, QLineEdit, QCheckBox, QPushButton,
     QLabel, QHBoxLayout, QVBoxLayout, QComboBox, QWidget, QTableWidget,
     QTableWidgetItem, QMessageBox, QInputDialog, QGridLayout, QSizePolicy,
-    QGroupBox, QSplitter, QPlainTextEdit
+    QGroupBox, QSplitter, QPlainTextEdit, QDialog
 )
 from PyQt5.QtGui import QPixmap, QImage, QFont
 from PyQt5.QtCore import QTimer, pyqtSignal, pyqtSlot, Qt, QThread, QSize
@@ -833,6 +834,7 @@ class _ExperimentBridge(QtCore.QObject):
     status_text_changed = pyqtSignal(str, str)    # which label ("fl"/"sam2"), text
     live_button_reset   = pyqtSignal()
     error_dialog        = pyqtSignal(str, str)    # title, message
+    verify_masks_requested = pyqtSignal(dict)     # {chemostat_number: mask_png_path}
 
 
 # ─────────────────────────────────────────────
@@ -1271,6 +1273,8 @@ class MicroscopeControlGUI(QMainWindow):
         self._experiment_stop_requested = False
         self._exp_worker = None
         self.shrink_auto_mode = False   # Manual is the default mode
+        self.interval_per_chemostat = {}      # {chem_num: 1|2|3}, Timelapse Experiment only
+        self.shrink_mode_per_chemostat = {}   # {chem_num: bool} - overrides shrink_auto_mode per chemostat
         self._init_microscope()
         self._build_ui()
         self.setWindowTitle('Microscope Control')
@@ -1293,6 +1297,8 @@ class MicroscopeControlGUI(QMainWindow):
         self._exp_bridge.status_text_changed.connect(self._on_status_text_changed)
         self._exp_bridge.live_button_reset.connect(self._on_live_button_reset)
         self._exp_bridge.error_dialog.connect(self._on_error_dialog)
+        self._exp_bridge.verify_masks_requested.connect(self._on_verify_masks_requested)
+        self._mask_verify_approved = None   # None = pending, True/False = answered
 
     @pyqtSlot(int, bool)
     def _on_valve_style_changed(self, idx, state):
@@ -1319,6 +1325,59 @@ class MicroscopeControlGUI(QMainWindow):
     @pyqtSlot(str, str)
     def _on_error_dialog(self, title, message):
         QMessageBox.critical(self, title, message)
+
+    @pyqtSlot(dict)
+    def _on_verify_masks_requested(self, mask_paths):
+        """
+        Shown once per experiment, right before auto-shrink runs its first
+        real shrink - lets the user visually confirm each chemostat's
+        initial droplet mask looks right before anything gets shrunk.
+        Blocks (modal) on the GUI thread; the worker thread that emitted
+        verify_masks_requested is meanwhile polling self._mask_verify_approved
+        (see _run_auto_shrink), so this dialog does not freeze the rest of
+        the app - it just holds up the experiment until answered.
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Verify initial droplet masks")
+        layout = QVBoxLayout(dlg)
+        info = QLabel(
+            "Check that each chemostat's initial droplet mask looks correct "
+            "before shrinking begins. This only appears once per experiment."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        for chem_num in sorted(mask_paths):
+            path = mask_paths[chem_num]
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"Chemostat {chem_num}:"))
+            img_lbl = QLabel()
+            pix = QPixmap(path)
+            if not pix.isNull():
+                img_lbl.setPixmap(pix.scaledToWidth(240, Qt.SmoothTransformation))
+            else:
+                img_lbl.setText(f"(couldn't load {path})")
+            row.addWidget(img_lbl)
+            layout.addLayout(row)
+
+        btn_row = QHBoxLayout()
+        proceed_btn = QPushButton("Looks good — proceed")
+        proceed_btn.setStyleSheet(BTN_GREEN)
+        abort_btn = QPushButton("Abort experiment")
+        abort_btn.setStyleSheet(BTN_RED)
+        btn_row.addWidget(proceed_btn)
+        btn_row.addWidget(abort_btn)
+        layout.addLayout(btn_row)
+
+        proceed_btn.clicked.connect(lambda: (setattr(self, '_mask_verify_approved', True), dlg.accept()))
+        abort_btn.clicked.connect(lambda: (setattr(self, '_mask_verify_approved', False), dlg.reject()))
+
+        dlg.exec_()
+        # If the dialog was closed via the window's X button, treat that as
+        # an abort rather than leaving _mask_verify_approved stuck at None
+        # (which would hang the worker thread's poll loop forever).
+        if self._mask_verify_approved is None:
+            self._mask_verify_approved = False
 
     # ── console log ───────────────────────────────────────
     def _setup_console_log(self):
@@ -1854,6 +1913,41 @@ class MicroscopeControlGUI(QMainWindow):
         proto_tbl_layout = QVBoxLayout()
         proto_tbl_layout.addWidget(self.Chemostat_protocol_table)
         left.addWidget(group("Protocol Steps", proto_tbl_layout))
+
+        # -- Per-chemostat cycle interval (regular Timelapse Experiment only).
+        #    Imaging of all positions always runs at the shortest interval
+        #    entered in the Timing panel; each chemostat's replenishment
+        #    (shrink + generate + drive) runs at its assigned interval.
+        interval_wrapper = QVBoxLayout()
+        interval_info = QLabel(
+            "Which Timing-panel interval (1/2/3) each chemostat's replenishment runs "
+            "on. Imaging always runs for all positions at the shortest interval "
+            "entered. Regular Timelapse Experiment only.")
+        interval_info.setStyleSheet("color:#aaa; font-size:11px;")
+        interval_info.setWordWrap(True)
+        interval_wrapper.addWidget(interval_info)
+        self.interval_per_chem_layout = QHBoxLayout()
+        self.interval_per_chem_layout.setSpacing(6)
+        interval_wrapper.addLayout(self.interval_per_chem_layout)
+        left.addWidget(group("Per-Chemostat Cycle Interval", interval_wrapper))
+
+        # -- Per-chemostat shrink mode - rebuilt automatically to match
+        #    whichever chemostats are addressed in Chemostat_protocol_steps
+        #    (see _refresh_shrink_mode_panel, called from add_loading_step /
+        #    clear_last_step / clear_all_steps).
+        shrink_mode_wrapper = QVBoxLayout()
+        shrink_mode_info = QLabel(
+            "Auto/Manual shrink mode per chemostat, based on which ones are "
+            "used in the protocol table above:")
+        shrink_mode_info.setStyleSheet("color:#aaa; font-size:11px;")
+        shrink_mode_info.setWordWrap(True)
+        shrink_mode_wrapper.addWidget(shrink_mode_info)
+        self.shrink_per_chem_layout = QHBoxLayout()
+        self.shrink_per_chem_layout.setSpacing(6)
+        shrink_mode_wrapper.addLayout(self.shrink_per_chem_layout)
+        left.addWidget(group("Per-Chemostat Shrink Mode", shrink_mode_wrapper))
+        self._refresh_shrink_mode_panel()
+
         left.addStretch()
 
         # ── RIGHT COLUMN ───────────────────────
@@ -1864,8 +1958,15 @@ class MicroscopeControlGUI(QMainWindow):
         timing_grid = QGridLayout(); timing_grid.setSpacing(6)
         self.cycle_Interval_Input = QLineEdit("0")
         self.cycle_Input          = QLineEdit("0")
+        # Extra intervals (0 = unused) - only used by the regular
+        # Timelapse Experiment, where each chemostat can be assigned to one
+        # of up to 3 intervals (see Per-Chemostat Cycle Interval panel).
+        self.cycle_Interval2_Input = QLineEdit("0")
+        self.cycle_Interval3_Input = QLineEdit("0")
         for r, (lbl, w) in enumerate([
-            ("Cycle interval (min):",      self.cycle_Interval_Input),
+            ("Cycle interval 1 (min):",    self.cycle_Interval_Input),
+            ("Cycle interval 2 (min):",    self.cycle_Interval2_Input),
+            ("Cycle interval 3 (min):",    self.cycle_Interval3_Input),
             ("Total duration (min):",      self.cycle_Input)
         ]):
             l = QLabel(lbl); l.setStyleSheet("color:#aaa;")
@@ -2321,6 +2422,7 @@ class MicroscopeControlGUI(QMainWindow):
             lyt.addWidget(cb)
             self.Chemostat_protocol_table.setCellWidget(2 + i, col, w)
         self.current_protocol_table_step += 1
+        self._refresh_shrink_mode_panel()
 
     def clear_all_steps(self):
         self.Chemostat_protocol_steps = []
@@ -2331,6 +2433,7 @@ class MicroscopeControlGUI(QMainWindow):
                     self.Chemostat_protocol_table.setItem(r, c, QTableWidgetItem(""))
                 else:
                     self.Chemostat_protocol_table.setCellWidget(r, c, self.create_centered_checkbox())
+        self._refresh_shrink_mode_panel()
 
     def clear_last_step(self):
         if not self.Chemostat_protocol_steps:
@@ -2346,6 +2449,7 @@ class MicroscopeControlGUI(QMainWindow):
                 if frame:
                     cb = frame.layout().itemAt(0).widget()
                     if cb: cb.setChecked(False)
+        self._refresh_shrink_mode_panel()
 
     def export_to_csv(self):
         if not self.Chemostat_protocol_steps:
@@ -2407,6 +2511,84 @@ class MicroscopeControlGUI(QMainWindow):
             self.shrink_mode_button.setText("Mode: Manual")
             self.shrink_mode_button.setStyleSheet(BTN_RED)
 
+    def _refresh_shrink_mode_panel(self):
+        """
+        Rebuild the per-chemostat Auto/Manual row to match whichever
+        chemostats are currently addressed anywhere in
+        Chemostat_protocol_steps. Called from add_loading_step /
+        clear_last_step / clear_all_steps, so it always reflects the
+        current protocol table. Existing per-chemostat choices
+        (self.shrink_mode_per_chemostat) are preserved across refreshes -
+        a chemostat that's newly addressed defaults to whatever the
+        global Mode button is currently set to.
+        """
+        self._refresh_interval_panel()
+        while self.shrink_per_chem_layout.count():
+            item = self.shrink_per_chem_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        used_chemostats = set()
+        for step in self.Chemostat_protocol_steps:
+            for rn, active in enumerate(step["rings"]):
+                if active:
+                    used_chemostats.add(rn + 1)
+
+        if not used_chemostats:
+            placeholder = QLabel("No chemostats used in the protocol table yet.")
+            placeholder.setStyleSheet("color:#888; font-style:italic;")
+            self.shrink_per_chem_layout.addWidget(placeholder)
+            return
+
+        for chem_num in sorted(used_chemostats):
+            is_auto = self.shrink_mode_per_chemostat.get(chem_num, self.shrink_auto_mode)
+            btn = QPushButton()
+            btn.setCheckable(True)
+            btn.setChecked(is_auto)
+            self._style_chemostat_shrink_mode_button(btn, chem_num, is_auto)
+            btn.clicked.connect(
+                lambda checked, c=chem_num, b=btn: self._on_toggle_chemostat_shrink_mode(c, b, checked))
+            self.shrink_per_chem_layout.addWidget(btn)
+
+    def _refresh_interval_panel(self):
+        """Rebuild the per-chemostat interval selectors (1/2/3) to match the
+        chemostats used in Chemostat_protocol_steps, keeping earlier choices."""
+        while self.interval_per_chem_layout.count():
+            item = self.interval_per_chem_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        used_chemostats = set()
+        for step in self.Chemostat_protocol_steps:
+            for rn, active in enumerate(step["rings"]):
+                if active:
+                    used_chemostats.add(rn + 1)
+
+        if not used_chemostats:
+            placeholder = QLabel("No chemostats used in the protocol table yet.")
+            placeholder.setStyleSheet("color:#888; font-style:italic;")
+            self.interval_per_chem_layout.addWidget(placeholder)
+            return
+
+        for chem_num in sorted(used_chemostats):
+            self.interval_per_chem_layout.addWidget(QLabel(f"Chem {chem_num}:"))
+            combo = QComboBox()
+            combo.addItems(["Int 1", "Int 2", "Int 3"])
+            combo.setCurrentIndex(self.interval_per_chemostat.get(chem_num, 1) - 1)
+            combo.currentIndexChanged.connect(
+                lambda idx, c=chem_num: self.interval_per_chemostat.__setitem__(c, idx + 1))
+            self.interval_per_chem_layout.addWidget(combo)
+
+    def _style_chemostat_shrink_mode_button(self, btn, chem_num, is_auto):
+        btn.setText(f"Chem {chem_num}: {'Auto' if is_auto else 'Manual'}")
+        btn.setStyleSheet(BTN_GREEN if is_auto else BTN_RED)
+
+    def _on_toggle_chemostat_shrink_mode(self, chem_num, btn, checked):
+        self.shrink_mode_per_chemostat[chem_num] = checked
+        self._style_chemostat_shrink_mode_button(btn, chem_num, checked)
+
     def _measure_chemostat_droplet_area(self, chem_num, positions_table, filt, exp, save_tag=None):
         """
         Move to the stage position for chemostat chem_num, snap an FL
@@ -2432,10 +2614,24 @@ class MicroscopeControlGUI(QMainWindow):
         if save_tag is not None:
             mask_fname = f"Mask_chemostat{chem_num}_{save_tag}.png"
             cv2.imwrite(os.path.join(".", mask_fname), overlay)
+            # The raw frame the mask was made from, so a bad measurement
+            # can be diagnosed afterwards.
+            raw_fname = f"Raw_chemostat{chem_num}_{save_tag}.tiff"
+            tiff.imwrite(os.path.join(".", raw_fname), raw_fl)
         return area
 
+    def _stash_suspect_measurement(self, chem_num, save_tag):
+        """Rename a suspect measurement's mask + raw frame to *_suspect so the
+        retry (which reuses save_tag) doesn't overwrite them."""
+        for stem, ext in ((f"Mask_chemostat{chem_num}_{save_tag}", ".png"),
+                          (f"Raw_chemostat{chem_num}_{save_tag}", ".tiff")):
+            src = os.path.join(".", stem + ext)
+            if os.path.exists(src):
+                os.replace(src, os.path.join(".", f"{stem}_suspect{ext}"))
+
     def _run_auto_shrink(self, used_chemostats, positions_table, selected_exposures,
-                          shrink_duration, shrink_initial_areas):
+                          shrink_duration, shrink_initial_areas,
+                          shrink_calibrated_durations=None, loop_num=1):
         """
         Adaptively shrink every chemostat in used_chemostats until its
         droplet area is below shrink_target_ratio_Input x its initial area
@@ -2452,9 +2648,28 @@ class MicroscopeControlGUI(QMainWindow):
         MAX_ROUNDS; a chemostat still oversized after that is logged and
         left as-is so the experiment can proceed. Duration is never let
         drop below MIN_SHRINK_DURATION.
+
+        If a chemostat overshoots below the target ratio in a round, that
+        round's duration was too long. shrink_calibrated_durations (kept by
+        the caller across loops of the whole experiment) is updated with
+        the duration that - using the same observed rate - would have
+        landed it right at the target, so later loops start from that
+        calibrated duration instead of repeating the raw shrink_duration
+        and overshooting again. Since the rate estimate is linear, the
+        actual result can land within +/-0.01x of the target; that's fine.
+
+        Each round's area measurement is saved as Mask_chemostat#_cycle#,
+        tagged by loop_num (the caller's time-interval/loop number), not by
+        round_num - a later round in the same interval overwrites the same
+        file, so once a chemostat stops pending only its last round's mask
+        for that interval survives, and different intervals never collide.
         """
+        if shrink_calibrated_durations is None:
+            shrink_calibrated_durations = {}
         MAX_ROUNDS = 4
         MIN_SHRINK_DURATION = 0.5
+        MAX_SHRINK_DURATION = 1.5 * shrink_duration  # guards against runaway extrapolation from a tiny/noisy drop
+        SUSPECT_RATIO = 1.5
 
         target_ratio = float(self.shrink_target_ratio_Input.text())
         if not selected_exposures:
@@ -2470,6 +2685,7 @@ class MicroscopeControlGUI(QMainWindow):
             return
         filt, exp = selected_exposures[0]
 
+        newly_measured_masks = {}   # {chem_num: mask_png_path}, only ones measured just now
         for chem_num in used_chemostats:
             if self._experiment_stop_requested:
                 raise ExperimentStopped()
@@ -2477,10 +2693,27 @@ class MicroscopeControlGUI(QMainWindow):
                 area = self._measure_chemostat_droplet_area(
                     chem_num, positions_table, filt, exp, save_tag="initial")
                 shrink_initial_areas[chem_num] = area
+                newly_measured_masks[chem_num] = os.path.join(".", f"Mask_chemostat{chem_num}_initial.png")
                 print(f"  Chemostat {chem_num}: initial area recorded = {area} px")
 
+        if newly_measured_masks:
+            # First time shrinking anything this experiment - pause and let
+            # the user visually confirm the masks before anything actually
+            # gets shrunk. Runs once per experiment (subsequent loops reuse
+            # the cached baseline and never hit this).
+            self._mask_verify_approved = None
+            self._exp_bridge.verify_masks_requested.emit(newly_measured_masks)
+            while self._mask_verify_approved is None:
+                if self._experiment_stop_requested:
+                    raise ExperimentStopped()
+                time.sleep(0.1)
+            if not self._mask_verify_approved:
+                print("  Initial masks rejected by user - stopping the experiment.")
+                raise ExperimentStopped()
+
         pending    = set(used_chemostats)
-        durations  = {c: shrink_duration for c in used_chemostats}
+        durations  = {c: shrink_calibrated_durations.get(c, shrink_duration)
+                      for c in used_chemostats}
         prev_ratio = {c: 1.0 for c in used_chemostats}
 
         round_num = 0
@@ -2491,6 +2724,7 @@ class MicroscopeControlGUI(QMainWindow):
                     raise ExperimentStopped()
                 dur = max(MIN_SHRINK_DURATION, durations[chem_num])
                 durations[chem_num] = dur
+                print(f"  Chemostat {chem_num}: shrinking for {dur:.2f}s (round {round_num})")
                 sw = DropletWorker("shrink", chemostat_number=chem_num, shrink_duration=dur)
                 sw.start(); sw.wait()
 
@@ -2500,12 +2734,54 @@ class MicroscopeControlGUI(QMainWindow):
                     raise ExperimentStopped()
                 initial = shrink_initial_areas[chem_num]
                 area    = self._measure_chemostat_droplet_area(
-                    chem_num, positions_table, filt, exp, save_tag=f"cycle{round_num}")
+                    chem_num, positions_table, filt, exp, save_tag=f"cycle{loop_num}")
                 ratio   = area / initial if initial > 0 else 1.0
                 print(f"  Chemostat {chem_num} shrink round {round_num}: "
                       f"ratio={ratio:.3f} (target {target_ratio})")
+                if ratio > SUSPECT_RATIO:
+                    # A shrinking droplet can't end up far bigger than its
+                    # baseline - this is a bad frame/measurement, and
+                    # extrapolating a rate from it would produce nonsense
+                    # durations. Keep the bad frame as *_suspect, re-snap
+                    # once after a short wait, and only give up on this
+                    # chemostat for the interval if the retry is also bad.
+                    print(f"  WARNING: chemostat {chem_num} ratio {ratio:.3f} is implausibly "
+                          f"large (> {SUSPECT_RATIO}) - re-snapping once.")
+                    self._stash_suspect_measurement(chem_num, f"cycle{loop_num}")
+                    self._check_stop_and_sleep_chunked(2)
+                    area  = self._measure_chemostat_droplet_area(
+                        chem_num, positions_table, filt, exp, save_tag=f"cycle{loop_num}")
+                    ratio = area / initial if initial > 0 else 1.0
+                    print(f"  Chemostat {chem_num} re-snap: ratio={ratio:.3f}")
+                    if ratio > SUSPECT_RATIO:
+                        print(f"  WARNING: chemostat {chem_num} re-snap still implausible - "
+                              f"not shrinking it further this interval. Check "
+                              f"Mask_chemostat{chem_num}_cycle{loop_num}_suspect.png / "
+                              f"Raw_chemostat{chem_num}_cycle{loop_num}_suspect.tiff.")
+                        continue
                 if ratio <= target_ratio:
                     print(f"  Chemostat {chem_num}: reached target after {round_num} round(s).")
+                    if ratio < target_ratio and round_num == 1:
+                        # Overshot on the very first shrink of this time
+                        # interval - the duration just used (`used_dur`) shrank
+                        # it from prev_ratio (1.0) to ratio, i.e. rate =
+                        # (prev_ratio-ratio)/used_dur. The duration that would
+                        # have landed exactly on target at that same rate is
+                        # used_dur*(prev_ratio-target_ratio)/(prev_ratio-ratio)
+                        # (e.g. 5s shrinking 1.0x->0.8x against a 0.85x target
+                        # recalibrates to (1-0.85)*5/(1-0.8) = 3.75s). Cached
+                        # for future loops of this experiment. Only checked on
+                        # round 1 - an overshoot in a later round of the same
+                        # interval is left alone (it's already converging via
+                        # the normal per-round adaptive duration).
+                        used_dur = durations[chem_num]
+                        drop     = prev_ratio[chem_num] - ratio
+                        if drop > 1e-6:
+                            calibrated_dur = used_dur * (prev_ratio[chem_num] - target_ratio) / drop
+                            calibrated_dur = max(MIN_SHRINK_DURATION, calibrated_dur)
+                            shrink_calibrated_durations[chem_num] = calibrated_dur
+                            print(f"  Chemostat {chem_num}: overshot to {ratio:.3f} - "
+                                  f"calibrating future shrink duration to {calibrated_dur:.2f}s")
                     continue
 
                 drop    = prev_ratio[chem_num] - ratio
@@ -2517,7 +2793,8 @@ class MicroscopeControlGUI(QMainWindow):
                     # No measurable progress this round - try a longer pass
                     # rather than repeating a duration that didn't work.
                     next_dur = used_dur * 1.5
-                durations[chem_num]  = max(MIN_SHRINK_DURATION, next_dur)
+                durations[chem_num]  = min(MAX_SHRINK_DURATION,
+                                           max(MIN_SHRINK_DURATION, next_dur))
                 prev_ratio[chem_num] = ratio
                 still_pending.add(chem_num)
             pending = still_pending
@@ -3454,11 +3731,13 @@ class MicroscopeControlGUI(QMainWindow):
 
     # ── timelapse experiment ──────────────────
     def TimeLapse_Experiment(self, num_loops, time_interval, positions_table,
-                              selected_exposures, chemostat_protocol_table):
+                              selected_exposures, chemostat_protocol_table,
+                              chemostat_intervals=None):
         try:
             self._TimeLapse_Experiment_body(
                 num_loops, time_interval, positions_table,
-                selected_exposures, chemostat_protocol_table)
+                selected_exposures, chemostat_protocol_table,
+                chemostat_intervals)
         except Exception:
             # Stop (ExperimentStopped) or a real failure mid-run: reset to a
             # known-safe state before propagating so ExperimentWorker can
@@ -3469,7 +3748,8 @@ class MicroscopeControlGUI(QMainWindow):
             raise
 
     def _TimeLapse_Experiment_body(self, num_loops, time_interval, positions_table,
-                                    selected_exposures, chemostat_protocol_table):
+                                    selected_exposures, chemostat_protocol_table,
+                                    chemostat_intervals=None):
 
         # Initialise valves
         init_states = [
@@ -3487,105 +3767,241 @@ class MicroscopeControlGUI(QMainWindow):
 
         # Auto-shrink's per-chemostat initial-area baseline is measured once
         # and reused for the whole experiment (not re-measured every loop),
-        # so this dict lives outside the loop below.
+        # so this dict lives outside the loop below. shrink_calibrated_durations
+        # holds the learned duration for each chemostat once it has overshot
+        # its target at least once, so later loops start from a better guess
+        # instead of always repeating the raw UI shrink duration.
         shrink_initial_areas = {}
+        shrink_calibrated_durations = {}
 
-        for loop in range(num_loops):
-            print(f"--- Loop {loop+1}/{num_loops} ---")
-            loop_start = time.time()
+        # ── Scheduler ────────────────────────────────────────────────────────
+        # Imaging (every position, every exposure) always runs at
+        # time_interval, the shortest interval entered. Each chemostat's
+        # replenishment (buffer flush, shrink, purge/generate/drive) runs on
+        # the interval it was assigned (chemostat_intervals, minutes), up to
+        # 3 distinct ones. All tasks run one after another on this single
+        # worker thread, so nothing ever overlaps: tasks that come due while
+        # something is running simply wait and run right after it finishes
+        # (together, as one "tick", in the order imaging -> shorter interval
+        # -> longer interval). Due times sit on a fixed grid anchored at the
+        # experiment start, so delays never shift later occurrences; if a
+        # task falls a whole interval behind, the missed occurrence is
+        # skipped with a warning rather than run back-to-back.
+        imaging_interval_s = time_interval * 60
+        end_s = num_loops * imaging_interval_s
 
-            for ci in range(len(positions_table)):
-                self.mmc.setXYPosition(positions_table[ci][0], positions_table[ci][1])
-                self.mmc.setPosition(positions_table[ci][2])
-                self.mmc.waitForSystem(); time.sleep(0.5)
-                for filt, exp in selected_exposures:
-                    img = self.snap_EPI_image(filt, exp)
-                    fn  = f"Expt_{ci+1}_{filt}_{exp}_{loop+1}.tiff"
-                    time.sleep(0.2)
-                    tiff.imwrite(os.path.join(".", fn), img)
+        def n_occurrences(interval_s):
+            if interval_s <= 0:
+                return 1
+            return max(1, math.ceil(end_s / interval_s - 1e-9))
 
-            if self.Chemostat_protocol_steps:
-                self.open_inlet(self.Buffer_inlet)
-                time.sleep(2)
-                self.close_inlet(self.Buffer_inlet)
+        used_chemostats_all = set()
+        for step in chemostat_protocol_table:
+            for rn, active in enumerate(step["rings"]):
+                if active:
+                    used_chemostats_all.add(rn + 1)
 
-                # Shrink every chemostat used anywhere in the protocol
-                # table, highest chemostat number first, one worker at a
-                # time (wait for each to finish before starting the next).
-                used_chemostats = set()
-                for step in self.Chemostat_protocol_steps:
-                    for rn, active in enumerate(step["rings"]):
-                        if active:
-                            used_chemostats.add(rn + 1)
+        groups = {}   # {interval_min: set(chemostat numbers)}
+        for c in used_chemostats_all:
+            iv = (chemostat_intervals or {}).get(c, time_interval)
+            groups.setdefault(iv, set()).add(c)
 
-                if self.shrink_auto_mode:
-                    self._run_auto_shrink(
-                        used_chemostats, positions_table, selected_exposures,
-                        shrink_duration, shrink_initial_areas)
+        tasks = {("imaging", 0): {
+            "prio": 0, "interval_s": imaging_interval_s,
+            "count": num_loops, "k": 0, "chems": None}}
+        for prio, iv in enumerate(sorted(groups), start=1):
+            tasks[("replenish", iv)] = {
+                "prio": prio, "interval_s": iv * 60,
+                "count": n_occurrences(iv * 60), "k": 0, "chems": groups[iv]}
+
+        print(f"Schedule: imaging of all positions every {time_interval} min"
+              + "".join(f"; chemostat(s) {sorted(groups[iv])} replenished every {iv} min"
+                        for iv in sorted(groups)))
+
+        t0 = time.time()
+        while True:
+            open_tasks = {key: t for key, t in tasks.items() if t["k"] < t["count"]}
+            if not open_tasks:
+                break
+            next_due = min(t["k"] * t["interval_s"] for t in open_tasks.values())
+            now = time.time() - t0
+            if next_due > now:
+                print(f"Waiting {next_due - now:.1f}s …")
+                self._check_stop_and_sleep_chunked(next_due - now)
+                now = max(time.time() - t0, next_due)
+
+            batch = sorted(
+                (t["prio"], key) for key, t in open_tasks.items()
+                if t["k"] * t["interval_s"] <= now)
+
+            bracket_open = False
+            for idx, (_, key) in enumerate(batch):
+                task = tasks[key]
+                due_s = task["k"] * task["interval_s"]
+                imaging_cycle = (int(due_s // imaging_interval_s) + 1
+                                 if imaging_interval_s > 0 else 1)
+                # Valve 11 is opened/closed around each replenishment (not
+                # once per tick): drive_droplet closes it itself, which would
+                # otherwise leave it closed for every task after the first
+                # replenishment in a tick. Imaging shares its bracket with the
+                # first replenishment that follows it.
+                if not bracket_open:
+                    self.control_valve(11, state = False)
+                    bracket_open = True
+                if key[0] == "imaging":
+                    print(f"--- Loop {task['k']+1}/{num_loops} (imaging, t={due_s/60:.1f} min) ---")
+                    self._run_imaging_cycle(
+                        positions_table, selected_exposures, task["k"] + 1,
+                        chemostat_intervals)
                 else:
-                    for chem_num in sorted(used_chemostats, reverse=True):
-                        if self._experiment_stop_requested:
-                            raise ExperimentStopped()
-                        sw = DropletWorker(
-                            "shrink", chemostat_number=chem_num,
-                            shrink_duration=shrink_duration,
-                        )
-                        sw.start(); sw.wait()
-
-                self.mmc.setProperty(self.DIAlamp, "State", 1)
-                if self.video_thread is not None and self.video_thread.isRunning():
-                    self.video_thread.stop()
-                    self.video_thread = None
-                self.video_thread = VideoThread()
-                self.video_thread.start()
-                QtCore.QThread.msleep(300)
-
-                for step in self.Chemostat_protocol_steps:
-                    send_to_arduino(2)
+                    print(f"--- Replenishing chemostat(s) {sorted(task['chems'])} "
+                          f"(every {key[1]} min, t={due_s/60:.1f} min) ---")
+                    self._run_replenishment(
+                        task["chems"], imaging_cycle, positions_table, selected_exposures,
+                        chemostat_protocol_table, shrink_duration, purge_duration,
+                        flow_duration, drive_duration,
+                        shrink_initial_areas, shrink_calibrated_durations)
+                share_with_next = key[0] == "imaging" and idx + 1 < len(batch)
+                if not share_with_next:
+                    self.control_valve(11, state=True)
                     send_to_arduino(4)
-                    i1 = step["input1"]; i2 = step["input2"]
-                    pw = DropletWorker("purge", inlets=[i1, i2], purge_duration=purge_duration)
-                    pw.start(); pw.wait()
-                    for rn, active in enumerate(step["rings"]):
-                        if active:
-                            self.mmc.setXYPosition(positions_table[rn][0], positions_table[rn][1])
-                            self.mmc.setPosition(positions_table[rn][2])
-                            gw = DropletWorker("generate", inlets=[i1], flow_duration=flow_duration)
-                            gw.start(); gw.wait()
-                            self.video_thread.start_recording()
-                            dw = DropletWorker("drive", i1, drive_duration=drive_duration, chemostat_number=rn+1)
-                            dw.start(); dw.wait()
-                            if self.video_thread and self.video_thread.isRunning():
-                                self.video_thread.stop_recording()
-                            # Brief pause to let the writer flush before the next clip
-                            QtCore.QThread.msleep(200)
+                    send_to_arduino(3)
+                    bracket_open = False
 
+                task["k"] += 1
+                now_done = time.time() - t0
+                while (task["k"] + 1 < task["count"]
+                       and (task["k"] + 1) * task["interval_s"] <= now_done):
+                    print(f"WARNING: {key[0]} {key[1] if key[0] == 'replenish' else ''} "
+                          f"is over an interval behind - skipping the missed occurrence "
+                          f"at t={task['k'] * task['interval_s'] / 60:.1f} min.")
+                    task["k"] += 1
 
-                    # Close / re-open flush valves between steps
-                    self.open_inlet(self.Buffer_inlet)
-                    self.control_valve(6,  state=False)
-                    time.sleep(1)
-                    self.close_inlet(self.Buffer_inlet)
-                    self.control_valve(6,  state=True)
-                    
-                self.video_thread.stop()
-                self.video_thread = None
-                self.mmc.setProperty(self.DIAlamp, "State", 0)
-
-                self.control_valve(11, state=True)
-                send_to_arduino(4)
-                send_to_arduino(3)
-
-
-            elapsed   = time.time() - loop_start
-            remaining = time_interval * 60 - elapsed
-            if remaining > 0:
-                print(f"Waiting {remaining:.1f}s …")
-                self._check_stop_and_sleep_chunked(remaining)
+        remaining = end_s - (time.time() - t0)
+        if remaining > 0:
+            print(f"Waiting {remaining:.1f}s …")
+            self._check_stop_and_sleep_chunked(remaining)
 
         self.mmc.setTimeoutMs(5000)  # restore default
         self._sam2_status("Experiment complete.")
-        self.control_valve(0, state=True)
+        self.control_valve(7, state=True)
+
+    def _run_imaging_cycle(self, positions_table, selected_exposures, loop_num,
+                           chemostat_intervals=None):
+        """Image every position with every selected exposure. Position N is
+        chemostat N; if that chemostat has a replenishment interval, its
+        files get a trailing _<interval>min field (e.g. Expt_4_3_20_7_10min.tiff)."""
+        for ci in range(len(positions_table)):
+            self.mmc.setTimeoutMs(30000)
+            self.mmc.setXYPosition(positions_table[ci][0], positions_table[ci][1])
+            self.mmc.setPosition(positions_table[ci][2])
+            self.mmc.waitForSystem()
+            self.mmc.setTimeoutMs(5000)  # restore default
+            time.sleep(0.5)
+            for filt, exp in selected_exposures:
+                img = self.snap_EPI_image(filt, exp)
+                iv  = (chemostat_intervals or {}).get(ci + 1)
+                iv_tag = f"_{iv}min" if iv else ""
+                fn  = f"Expt_{ci+1}_{filt}_{exp}_{loop_num}{iv_tag}.tiff"
+                time.sleep(0.2)
+                tiff.imwrite(os.path.join(".", fn), img)
+
+    def _run_replenishment(self, chemostats, loop_num, positions_table, selected_exposures,
+                           chemostat_protocol_table, shrink_duration, purge_duration,
+                           flow_duration, drive_duration,
+                           shrink_initial_areas, shrink_calibrated_durations):
+        """
+        Buffer flush, shrink (manual/auto per chemostat), then every protocol
+        step (purge, generate droplet, drive) for just the given chemostats.
+        Steps that address none of them are skipped entirely.
+        """
+        steps = []
+        for step in chemostat_protocol_table:
+            rings = [bool(active) and (rn + 1) in chemostats
+                     for rn, active in enumerate(step["rings"])]
+            if any(rings):
+                steps.append({**step, "rings": rings})
+        if not steps:
+            return
+
+        self.open_inlet(self.Buffer_inlet)
+        time.sleep(2)
+        self.close_inlet(self.Buffer_inlet)
+
+        # Shrink every chemostat in this group, highest chemostat number
+        # first, one worker at a time (wait for each to finish before
+        # starting the next).
+        used_chemostats = set()
+        for step in steps:
+            for rn, active in enumerate(step["rings"]):
+                if active:
+                    used_chemostats.add(rn + 1)
+
+        # Each chemostat's mode comes from shrink_mode_per_chemostat
+        # (set via the Per-Chemostat Shrink Mode panel), falling
+        # back to the global Mode button for any chemostat that
+        # hasn't been individually set. Manual chemostats run
+        # first as a single fixed-duration pass (highest number
+        # first); auto ones then go through the adaptive loop.
+        auto_chemostats = {
+            c for c in used_chemostats
+            if self.shrink_mode_per_chemostat.get(c, self.shrink_auto_mode)
+        }
+        manual_chemostats = used_chemostats - auto_chemostats
+
+        for chem_num in sorted(manual_chemostats, reverse=True):
+            if self._experiment_stop_requested:
+                raise ExperimentStopped()
+            sw = DropletWorker(
+                "shrink", chemostat_number=chem_num,
+                shrink_duration=shrink_duration,
+            )
+            sw.start(); sw.wait()
+
+        if auto_chemostats:
+            self._run_auto_shrink(
+                auto_chemostats, positions_table, selected_exposures,
+                shrink_duration, shrink_initial_areas,
+                shrink_calibrated_durations, loop_num=loop_num)
+
+        self.mmc.setProperty(self.DIAlamp, "State", 1)
+        if self.video_thread is not None and self.video_thread.isRunning():
+            self.video_thread.stop()
+            self.video_thread = None
+        self.video_thread = VideoThread()
+        self.video_thread.start()
+        QtCore.QThread.msleep(300)
+
+        for step in steps:
+            send_to_arduino(2)
+            send_to_arduino(4)
+            i1 = step["input1"]; i2 = step["input2"]
+            pw = DropletWorker("purge", inlets=[i1, i2], purge_duration=purge_duration)
+            pw.start(); pw.wait()
+            for rn, active in enumerate(step["rings"]):
+                if active:
+                    self.mmc.setXYPosition(positions_table[rn][0], positions_table[rn][1])
+                    self.mmc.setPosition(positions_table[rn][2])
+                    gw = DropletWorker("generate", inlets=[i1], flow_duration=flow_duration)
+                    gw.start(); gw.wait()
+                    self.video_thread.start_recording()
+                    dw = DropletWorker("drive", i1, drive_duration=drive_duration, chemostat_number=rn+1)
+                    dw.start(); dw.wait()
+                    if self.video_thread and self.video_thread.isRunning():
+                        self.video_thread.stop_recording()
+                    # Brief pause to let the writer flush before the next clip
+                    QtCore.QThread.msleep(200)
+
+            # Close / re-open flush valves between steps
+            self.open_inlet(self.Buffer_inlet)
+            self.control_valve(6,  state=False)
+            time.sleep(1)
+            self.close_inlet(self.Buffer_inlet)
+            self.control_valve(6,  state=True)
+
+        self.video_thread.stop()
+        self.video_thread = None
+        self.mmc.setProperty(self.DIAlamp, "State", 0)
 
 
 
@@ -3615,16 +4031,38 @@ class MicroscopeControlGUI(QMainWindow):
                 total_min=int(self.cycle_Input.text()),
             )
         else:
-            time_interval = int(self.cycle_Interval_Input.text())
+            intervals_min = [int(self.cycle_Interval_Input.text()),
+                             int(self.cycle_Interval2_Input.text()),
+                             int(self.cycle_Interval3_Input.text())]
             total_duration = int(self.cycle_Input.text())
+            # Imaging runs at the shortest interval entered; each chemostat's
+            # replenishment runs at the interval it was assigned (falling
+            # back to the imaging interval if that one is 0/unused).
+            positive = [v for v in intervals_min if v > 0]
+            time_interval = min(positive) if positive else 0
             # "Total duration (min)" is the actual experiment length, not a
-            # loop count - the number of loops is however many cycle
+            # loop count - the number of loops is however many imaging
             # intervals fit into it.
             num_loops = max(1, round(total_duration / time_interval)) if time_interval > 0 else 1
+            snapshot_steps = list(self.Chemostat_protocol_steps)
+            chemostat_intervals = {}
+            for step in snapshot_steps:
+                for rn, active in enumerate(step["rings"]):
+                    if active:
+                        chem = rn + 1
+                        choice = self.interval_per_chemostat.get(chem, 1)
+                        iv = intervals_min[choice - 1]
+                        if iv <= 0:
+                            print(f"WARNING: chemostat {chem} is set to interval {choice}, "
+                                  f"which is 0/unused - using the imaging interval "
+                                  f"({time_interval} min) instead.")
+                            iv = time_interval
+                        chemostat_intervals[chem] = iv
             self._launch_experiment_worker(
                 self.TimeLapse_Experiment,
                 num_loops=num_loops,
                 time_interval=time_interval,
+                chemostat_intervals=chemostat_intervals,
                 # Snapshot into fresh lists rather than sharing the live
                 # attributes directly - the user can still click
                 # Save/Clear Position or Add Step while this worker thread
