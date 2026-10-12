@@ -1905,9 +1905,9 @@ class MicroscopeControlGUI(QMainWindow):
         info = QLabel(
             "No pre-experiment annotation needed.\n\n"
             "Every imaging interval:\n"
-            "  • FL image taken at every position (first filter/exposure\n"
-            "    from the exposure table is used for segmentation;\n"
-            "    all filters are saved)\n"
+            "  • Every position is imaged with the first filter/exposure\n"
+            "    row (used for size and fluorescence); positions in\n"
+            "    Synthesis or Maintain are also imaged with the other rows\n"
             "  • Droplet segmented via Otsu threshold + electrode bridge\n"
             f"  • Chemostat triggered if area < "
             f"{FL_AREA_THRESHOLD * 100:.0f}% of initial area\n\n"
@@ -2393,10 +2393,10 @@ class MicroscopeControlGUI(QMainWindow):
         Runs on a background ExperimentWorker thread (see _start_fl_experiment).
 
         Every `interval_min` minutes for `total_min` total minutes:
-          1. Move to every position and snap FL images for all filters
-             defined in the exposure table.
-             The FIRST filter/exposure entry is used for segmentation;
-             all filter images are saved as raw uint16 TIFFs.
+          1. Move to every position and snap an FL image with the FIRST
+             filter/exposure entry, used for segmentation and fluorescence.
+             Positions in Synthesis or Maintain mode are then also imaged
+             with every other entry. All images are saved as raw uint16 TIFFs.
           2. segment_droplet_fl() segments the droplet and measures its area.
              The segmentation overlay is saved alongside the TIFF for inspection.
           3. Initial area is recorded on the very first tick.
@@ -2421,9 +2421,9 @@ class MicroscopeControlGUI(QMainWindow):
         <base>/
           Position_1/
             FL/
-              Pos1_Loop1_filt1_100ms_3min.tiff        ← raw uint16
-              Pos1_Loop1_filt1_100ms_3min_mask.png    ← segmentation overlay
-              Pos1_Loop1_filt2_50ms_3min.tiff
+              Pos1_filt1_100ms_3min_Loop1.tiff        ← raw uint16
+              Pos1_filt1_100ms_3min_Loop1_mask.png    ← segmentation overlay
+              Pos1_filt2_50ms_3min_Loop1.tiff
               …
         """
         try:
@@ -2510,7 +2510,7 @@ class MicroscopeControlGUI(QMainWindow):
 
             triggered_positions = []
 
-            # ── Phase 1: first row of exposure table → area check, all positions ──
+            # ── Imaging: first row → area + fluorescence, all positions ──
             # selected_exposures[0] is the first row the user filled in —
             # whichever filter/exposure that happens to be.
             seg_filt, seg_exp = selected_exposures[0]
@@ -2540,19 +2540,19 @@ class MicroscopeControlGUI(QMainWindow):
                 raw_fl = self.snap_EPI_image(seg_filt, seg_exp)
 
                 # Save raw uint16 TIFF
-                # e.g. Pos1_Loop2_filt3_30ms_6min.tiff
+                # e.g. Pos1_filt3_30ms_6min_Loop2.tiff
                 fl_fname = (
-                    f"Pos{pos_num}_Loop{pos_loop}"
-                    f"_filt{seg_filt}_{seg_exp}ms_{time_tag_str}.tiff"
+                    f"Pos{pos_num}_filt{seg_filt}_{seg_exp}ms"
+                    f"_{time_tag_str}_Loop{pos_loop}.tiff"
                 )
                 tiff.imwrite(os.path.join(fl_dir, fl_fname), raw_fl)
 
                 # Segment and save overlay PNG for visual inspection
-                # e.g. Pos1_Loop2_filt3_30ms_6min_mask.png
+                # e.g. Pos1_filt3_30ms_6min_Loop2_mask.png
                 seg_mask, seg_area, seg_overlay = segment_droplet_fl(raw_fl)
                 overlay_fname = (
-                    f"Pos{pos_num}_Loop{pos_loop}"
-                    f"_filt{seg_filt}_{seg_exp}ms_{time_tag_str}_mask.png"
+                    f"Pos{pos_num}_filt{seg_filt}_{seg_exp}ms"
+                    f"_{time_tag_str}_Loop{pos_loop}_mask.png"
                 )
                 cv2.imwrite(os.path.join(fl_dir, overlay_fname), seg_overlay)
                 time.sleep(0.2)
@@ -2582,6 +2582,27 @@ class MicroscopeControlGUI(QMainWindow):
                             f"{FL_AREA_THRESHOLD * 100:.0f}%)"
                         )
 
+                # ── Synthesis / Maintain: also image the remaining rows ────
+                # Upconcentration (and unaddressed) positions only get the
+                # first row above. Uses the mode after this round's
+                # fluorescence check, so a position that just switched to
+                # Synthesis is imaged with every row from this round on.
+                if pos_mode.get(idx) in (MODE_SYNTH, MODE_MAINTAIN):
+                    for filt, exp in selected_exposures[1:]:
+                        if self._experiment_stop_requested:
+                            raise ExperimentStopped()
+                        self._fl_status(
+                            f"FL snap – Pos {pos_num} ({pos_mode[idx]})  "
+                            f"Loop {pos_loop}  filt {filt}  {exp}ms  @ {time_tag_str}"
+                        )
+                        raw_extra = self.snap_EPI_image(filt, exp)
+                        extra_fname = (
+                            f"Pos{pos_num}_filt{filt}_{exp}ms"
+                            f"_{time_tag_str}_Loop{pos_loop}.tiff"
+                        )
+                        tiff.imwrite(os.path.join(fl_dir, extra_fname), raw_extra)
+                        time.sleep(0.2)
+
             # ── no triggers this tick ─────────────────────────────────────────────
             if not triggered_positions:
                 print("  ✓ All droplets within acceptable size.")
@@ -2592,51 +2613,6 @@ class MicroscopeControlGUI(QMainWindow):
                 continue
 
             names = [f"Pos {i + 1}" for i in triggered_positions]
-            print(f"\n  ⚠ Triggered: {', '.join(names)}")
-
-            # ── Phase 2: remaining rows of exposure table → all positions ─────────
-            # Only runs when at least one position was triggered this tick.
-            # Row 0 was already imaged in Phase 1, so we start from row 1.
-            if len(selected_exposures) > 1:
-                # Reset shutter state after chemostat protocol before imaging.
-                # The chemostat sequence leaves the hardware in an uncertain
-                # shutter state; explicitly closing both shutters and waiting
-                # prevents waitForSystem() timing out on TIEpiShutter.
-                self.mmc.setProperty(self.EPIshutter, 'State', 0)
-                self.mmc.setProperty(self.DIAshutter, 'State', 0)
-                self.mmc.waitForSystem()
-                time.sleep(1.0)
-                self._fl_status("Full exposure table imaging of all positions …")
-                for idx, (px, py, pz) in enumerate(positions):
-                    if self._experiment_stop_requested:
-                        raise ExperimentStopped()
-                    pos_num  = idx + 1
-                    pos_loop = pos_loop_count.get(idx, 0) + 1
-
-                    fl_dir = os.path.join(base, f"Position_{pos_num}", "FL")
-                    os.makedirs(fl_dir, exist_ok=True)
-
-                    self.mmc.setTimeoutMs(30000)
-                    self.mmc.setXYPosition(px, py)
-                    self.mmc.waitForDevice(self.mmc.getXYStageDevice())
-                    self.mmc.setPosition(pz)
-                    self.mmc.waitForDevice(self.mmc.getFocusDevice())
-                    self.mmc.setTimeoutMs(5000)
-                    time.sleep(0.3)
-
-                    for filt, exp in selected_exposures[1:]:
-                        self._fl_status(
-                            f"FL snap – Pos {pos_num}  Loop {pos_loop}  "
-                            f"filt {filt}  {exp}ms  @ {time_tag_str}"
-                        )
-                        raw_fl = self.snap_EPI_image(filt, exp)
-                        fl_fname = (
-                            f"Pos{pos_num}_Loop{pos_loop}"
-                            f"_filt{filt}_{exp}ms_{time_tag_str}.tiff"
-                        )
-                        tiff.imwrite(os.path.join(fl_dir, fl_fname), raw_fl)
-                        time.sleep(0.2)
-
             print(f"\n  ⚠ Triggered: {', '.join(names)}")
 
             # ── feed triggered positions according to their current mode ───
