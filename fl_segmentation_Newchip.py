@@ -1069,12 +1069,16 @@ class VideoThread(QThread):
 #  Droplet worker thread
 # ─────────────────────────────────────────────
 class DropletWorker(QThread):
+    # Buffer inlet (1-9) chosen in tab 1's "Buffer Inlet" spinbox; the GUI
+    # keeps this in sync. generate_droplet always flows from this inlet.
+    buffer_inlet = 9
+
     def __init__(self, operation, input_1=None, input_2=None,
                  inlets=None,
                  purge_duration=0, flow_duration=0, drive_duration=0,
                  shrink_duration=0,
                  chemostat_number=4, PWM_duration1=0.05, PWM_duration2=0.05,
-                 PWM_totalduration=5):
+                 PWM_totalduration=5, chemostats=None, stop_check=None):
         super().__init__()
         self.Numato_port       = Numato_device
         self.operation         = operation
@@ -1089,6 +1093,8 @@ class DropletWorker(QThread):
         self.PWM_duration1     = PWM_duration1
         self.PWM_duration2     = PWM_duration2
         self.PWM_totalduration = PWM_totalduration
+        self.chemostats        = list(chemostats) if chemostats is not None else []
+        self.stop_check        = stop_check   # optional callable -> True to halt early
 
     def run(self):
         ops = {
@@ -1098,6 +1104,7 @@ class DropletWorker(QThread):
             "shrink":     lambda: self.shrink_droplet(self.chemostat),
             "characterize": lambda: self.characterize_droplet(*self.inlets, self.chemostat),
             "wash":       lambda: self.wash_step(self.input_1, self.input_2),
+            "initialize": lambda: self.initialize_chemostats(*self.inlets, self.chemostats),
 
         }
 
@@ -1129,13 +1136,31 @@ class DropletWorker(QThread):
         self.purge_inlet(inlet_1, inlet_2)        
         send_to_arduino(5)
         send_to_arduino(2)
-        '''self.control_valve(11, state=False)        
-        self.control_valve(chemostat_number + 11, state=True)
-        time.sleep(4)
-        self.control_valve(11, state=True)'''
         self.generate_droplet(inlet_1, inlet_2)
         self.drive_droplet(chemostat_number)
         send_to_arduino(3)
+
+    def initialize_chemostats(self, inlet_1, inlet_2, chemostats):
+        """
+        Fill the given chemostats with droplets: for each chemostat, one at
+        a time, run the whole replenishment scheme (purge, generate, drive -
+        the same sequence as the Generate Droplet button) twice in a row,
+        using this worker's purge/flow/drive durations. stop_check, if
+        given, is polled before each pass so a Stop request halts it
+        between passes (never mid valve sequence).
+        """
+        for chem in chemostats:
+            for rep in (1, 2):
+                if self.stop_check is not None and self.stop_check():
+                    print("Initialize chemostats: stop requested - halting.")
+                    return
+                print(f"Initializing chemostat {chem}: replenishment pass {rep}/2")
+                self.purge_inlet(inlet_1, inlet_2)        
+                send_to_arduino(5)
+                send_to_arduino(2)
+                self.generate_chemostat(chem)
+                self.drive_droplet(chem)
+                send_to_arduino(3)
 
     def _inlet_to_valves(self, inlet: int) -> tuple:
         """
@@ -1217,12 +1242,12 @@ class DropletWorker(QThread):
 
     def generate_droplet(self, *inlets: int):
         """
-        Generate a droplet from one or more inlets.
-        Opens the valve pairs for each requested inlet plus the hardcoded
-        downstream flow valves (8, 9), flows for Flow_duration, then closes.
+        Generate a droplet. Always flows from the buffer inlet set in tab 1
+        (DropletWorker.buffer_inlet), whatever inlets the caller passes.
+        Opens that inlet's valve pair plus the hardcoded downstream flow
+        valves (8, 9), flows for Flow_duration, then closes.
         """
-        if not inlets:
-            return
+        inlets = (self.buffer_inlet,)
 
         valves_to_open = set()
         for inlet in inlets:
@@ -1247,6 +1272,35 @@ class DropletWorker(QThread):
         for v in valves_to_open:
             self.control_valve(v, state=True)
         time.sleep(0.2)
+
+
+    def generate_chemostat(self, chem_number):
+        """
+        Generate a chemostat from one or more inlets.
+        Opens the valve pairs for each requested inlet plus the hardcoded
+        downstream flow valves (8, 9), flows for Flow_duration, then closes.
+        """
+        inlets = (self.buffer_inlet,)
+
+        valves_to_open = set()
+        for inlet in inlets:
+            a, b = self._inlet_to_valves(inlet)
+            valves_to_open.add(a)
+            valves_to_open.add(b)
+
+        
+        for v in valves_to_open:
+            self.control_valve(v, state=False)
+        print("generated valves", valves_to_open)
+        send_to_arduino(5)
+        self.control_valve(11, state=False)
+        self.control_valve(chem_number + 11, state=True)
+        self.control_valve(8,  state=False)   # hardcoded downstream flow valve
+        time.sleep(self.Flow_duration)
+        self.control_valve(8,  state=True)
+        
+        for v in valves_to_open:
+            self.control_valve(v, state=True)
 
 
     def drive_droplet(self, Chemostat_number):
@@ -1783,6 +1837,51 @@ class MicroscopeControlGUI(QMainWindow):
         dp_grid.addLayout(inlet_row, 5, 0, 1, 2)
         right.addWidget(group("Droplet Parameters", dp_grid))
 
+        # -- Initialize chemostats: fills the ticked chemostats with droplets
+        #    (purge/generate/drive x2 each, durations from Droplet
+        #    Parameters above), then shrinks them to the desired area.
+        init_layout = QVBoxLayout()
+        init_layout.setSpacing(4)
+        self.init_inlet1_Input = QSpinBox()
+        self.init_inlet1_Input.setRange(1, 9)
+        self.init_inlet1_Input.setValue(1)
+        self.init_inlet2_Input = QSpinBox()
+        self.init_inlet2_Input.setRange(1, 9)
+        self.init_inlet2_Input.setValue(2)
+        init_inlet_row = QHBoxLayout()
+        init_inlet_row.setSpacing(8)
+        for text, spin in (("Inlet 1 (1-9):", self.init_inlet1_Input),
+                           ("Inlet 2 (1-9):", self.init_inlet2_Input)):
+            lbl = QLabel(text); lbl.setStyleSheet("color:#aaa;")
+            init_inlet_row.addWidget(lbl)
+            init_inlet_row.addWidget(spin, 1)
+        init_layout.addLayout(init_inlet_row)
+
+        init_chem_row = QHBoxLayout()
+        init_chem_row.setSpacing(6)
+        chem_lbl = QLabel("Chemostats:"); chem_lbl.setStyleSheet("color:#aaa;")
+        init_chem_row.addWidget(chem_lbl)
+        self.init_chem_checks = []
+        for i in range(8):
+            cb = QCheckBox(str(i + 1))
+            self.init_chem_checks.append(cb)
+            init_chem_row.addWidget(cb)
+        init_chem_row.addStretch()
+        init_layout.addLayout(init_chem_row)
+
+        self.init_desired_area_Input = QLineEdit("52000")
+        area_lbl = QLabel("Desired droplet area (px):"); area_lbl.setStyleSheet("color:#aaa;")
+        self.initialize_chemostats_button = QPushButton("Initialize Chemostats")
+        self.initialize_chemostats_button.setStyleSheet(BTN_GREEN)
+        self.initialize_chemostats_button.clicked.connect(self.Initialize_Chemostats)
+        init_area_row = QHBoxLayout()
+        init_area_row.setSpacing(8)
+        init_area_row.addWidget(area_lbl)
+        init_area_row.addWidget(self.init_desired_area_Input, 1)
+        init_area_row.addWidget(self.initialize_chemostats_button, 1)
+        init_layout.addLayout(init_area_row)
+        right.addWidget(group("Initialize Chemostats", init_layout))
+
         # -- Voltage
         volt_layout = QVBoxLayout(); volt_layout.setSpacing(6)
         volt_row = QHBoxLayout()
@@ -1807,8 +1906,10 @@ class MicroscopeControlGUI(QMainWindow):
         self.buffer_inlet_Input.setRange(1, 9)
         self.buffer_inlet_Input.setValue(9)
         self.buffer_inlet_Input.valueChanged.connect(
-            lambda v: setattr(self, "Buffer_inlet", v)
+            lambda v: (setattr(self, "Buffer_inlet", v),
+                       setattr(DropletWorker, "buffer_inlet", v))
         )
+        DropletWorker.buffer_inlet = self.buffer_inlet_Input.value()
         buf_layout.addWidget(buf_lbl)
         buf_layout.addWidget(self.buffer_inlet_Input)
         right.addWidget(group("Buffer Inlet", buf_layout))
@@ -2399,6 +2500,177 @@ class MicroscopeControlGUI(QMainWindow):
             drive_duration   = float(self.drive_duration_Input.text()),
             chemostat_number = int(self.inlet_Input.text()))
         self.Characterize_Droplet_thread.start()
+
+    def Initialize_Chemostats(self):
+        """
+        Initialize Chemostats button (GUI thread): validate and snapshot every
+        input, then run the whole initialization on a background
+        ExperimentWorker so the GUI stays responsive and the Stop button works.
+        Chemostat N is saved stage position N.
+        """
+        chemostats = [i + 1 for i, cb in enumerate(self.init_chem_checks) if cb.isChecked()]
+        if not chemostats:
+            QMessageBox.warning(self, "Initialize chemostats",
+                                "Tick at least one chemostat to initialize.")
+            return
+        try:
+            desired_area    = float(self.init_desired_area_Input.text())
+            purge_duration  = float(self.purge_duration_Input.text())
+            flow_duration   = float(self.flow_duration_Input.text())
+            drive_duration  = float(self.drive_duration_Input.text())
+            shrink_duration = float(self.Shrink_duration_Input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Initialize chemostats",
+                                "Desired area and the purge / flow / drive / shrink "
+                                "durations must all be numbers.")
+            return
+        if desired_area <= 0:
+            QMessageBox.warning(self, "Initialize chemostats",
+                                "Desired droplet area must be greater than 0.")
+            return
+        positions_table = [list(p) for p in self.positions]
+        missing = [c for c in chemostats if c > len(positions_table)]
+        if missing:
+            QMessageBox.warning(
+                self, "Initialize chemostats",
+                f"No saved stage position for chemostat(s) {missing} - chemostat N "
+                f"uses saved position N, and only {len(positions_table)} position(s) "
+                f"are saved.")
+            return
+        if not self.selected_exposures:
+            QMessageBox.warning(
+                self, "Initialize chemostats",
+                "Droplet area is measured with the first row of the exposure table - "
+                "set a filter/exposure and click Save Values first.")
+            return
+        self._launch_experiment_worker(
+            self._initialize_chemostats_run,
+            chemostats=chemostats,
+            inlet_1=self.init_inlet1_Input.value(),
+            inlet_2=self.init_inlet2_Input.value(),
+            desired_area=desired_area,
+            positions_table=positions_table,
+            selected_exposures=[list(e) for e in self.selected_exposures],
+            purge_duration=purge_duration,
+            flow_duration=flow_duration,
+            drive_duration=drive_duration,
+            shrink_duration=shrink_duration,
+        )
+
+    def _initialize_chemostats_run(self, **kwargs):
+        try:
+            self._initialize_chemostats_body(**kwargs)
+        except Exception:
+            # Stop or a real failure: reset to a known-safe state before
+            # propagating (same pattern as TimeLapse_Experiment).
+            self._safe_shutdown_valves()
+            raise
+
+    @staticmethod
+    def _init_area_line(pos_num, area, desired_area, tol):
+        pct = 100.0 * area / desired_area
+        if area > desired_area * (1 + tol):
+            verdict = f"TOO LARGE (> +{tol*100:.0f}%)"
+        elif area < desired_area * (1 - tol):
+            verdict = f"TOO SMALL (< -{tol*100:.0f}%)"
+        else:
+            verdict = f"within +/-{tol*100:.0f}%"
+        return (f"  Position {pos_num}: {area} px = {pct:.1f}% of desired "
+                f"({area - desired_area:+.0f} px) - {verdict}")
+
+    def _initialize_chemostats_body(self, chemostats, inlet_1, inlet_2, desired_area,
+                                    positions_table, selected_exposures,
+                                    purge_duration, flow_duration, drive_duration,
+                                    shrink_duration):
+        """
+        1. Fill: for each ticked chemostat, run purge/generate/drive twice
+           (DropletWorker "initialize").
+        2. Measure + report: droplet area at EVERY saved position vs the
+           desired area, in the log.
+        3. Shrink: for each ticked chemostat, one at a time (highest number
+           first), shrink and re-measure until its area is within +/-5% of
+           the desired area. Positions that weren't ticked are measured and
+           reported but never shrunk.
+        Measurement reuses _measure_chemostat_droplet_area (first row of the
+        exposure table + segment_droplet_fl), and saves
+        Mask_/Raw_chemostat#_init_before and ..._init_round# files.
+        """
+        TOL = 0.05
+        MAX_ROUNDS = 8
+        MIN_SHRINK_DURATION = 0.5
+        MAX_SHRINK_DURATION = 1.5 * shrink_duration
+        lo, hi = desired_area * (1 - TOL), desired_area * (1 + TOL)
+        chemostats = sorted(chemostats)
+
+        print(f"=== Initialize chemostats {chemostats}: desired area "
+              f"{desired_area:.0f} px (+/-{TOL*100:.0f}% = {lo:.0f}-{hi:.0f} px) ===")
+
+        # 1. fill
+        worker = DropletWorker(
+            "initialize", inlets=[inlet_1, inlet_2], chemostats=chemostats,
+            purge_duration=purge_duration, flow_duration=flow_duration,
+            drive_duration=drive_duration,
+            stop_check=lambda: self._experiment_stop_requested)
+        worker.start(); worker.wait()
+        if self._experiment_stop_requested:
+            raise ExperimentStopped()
+
+        # 2. measure + report every saved position
+        filt, exp = selected_exposures[0]
+        areas = {}
+        print("Measuring droplet area at every saved position:")
+        for pos_num in range(1, len(positions_table) + 1):
+            if self._experiment_stop_requested:
+                raise ExperimentStopped()
+            areas[pos_num] = self._measure_chemostat_droplet_area(
+                pos_num, positions_table, filt, exp, save_tag="init_before")
+            print(self._init_area_line(pos_num, areas[pos_num], desired_area, TOL))
+
+        # 3. shrink each ticked chemostat until within tolerance
+        for chem_num in sorted(chemostats, reverse=True):
+            area = areas[chem_num]
+            if lo <= area <= hi:
+                print(f"  Chemostat {chem_num}: already within range - no shrinking needed.")
+                continue
+            if area < lo:
+                print(f"  Chemostat {chem_num}: already below the range - shrinking "
+                      f"can't make it bigger, leaving it as is.")
+                continue
+
+            print(f"  Chemostat {chem_num}: shrinking from {area} px toward {desired_area:.0f} px")
+            dur = min(MAX_SHRINK_DURATION, max(MIN_SHRINK_DURATION, shrink_duration))
+            prev_area = area
+            for round_num in range(1, MAX_ROUNDS + 1):
+                if self._experiment_stop_requested:
+                    raise ExperimentStopped()
+                print(f"  Chemostat {chem_num}: shrinking for {dur:.2f}s (round {round_num})")
+                sw = DropletWorker("shrink", chemostat_number=chem_num, shrink_duration=dur)
+                sw.start(); sw.wait()
+                area = self._measure_chemostat_droplet_area(
+                    chem_num, positions_table, filt, exp, save_tag=f"init_round{round_num}")
+                areas[chem_num] = area
+                print(self._init_area_line(chem_num, area, desired_area, TOL))
+                if lo <= area <= hi:
+                    print(f"  Chemostat {chem_num}: reached range after {round_num} round(s).")
+                    break
+                if area < lo:
+                    print(f"  WARNING: chemostat {chem_num} overshot below the range - "
+                          f"can't grow it back, stopping its shrinking.")
+                    break
+                drop = prev_area - area
+                if drop > 1e-6:
+                    next_dur = (area - desired_area) / (drop / dur)   # aim for the centre of the range
+                else:
+                    next_dur = dur * 1.5   # no measurable progress - try longer
+                dur = min(MAX_SHRINK_DURATION, max(MIN_SHRINK_DURATION, next_dur))
+                prev_area = area
+            else:
+                print(f"  WARNING: chemostat {chem_num} did not reach the range after "
+                      f"{MAX_ROUNDS} rounds - moving on.")
+
+        print("=== Initialize chemostats: final areas ===")
+        for pos_num in sorted(areas):
+            print(self._init_area_line(pos_num, areas[pos_num], desired_area, TOL))
 
     def PWM_droplet(self, input_1=12, input_2=13):
         self.PWM_thread = DropletWorker(
@@ -4167,7 +4439,8 @@ class MicroscopeControlGUI(QMainWindow):
         self.start_experiment_button.setEnabled(enabled)
         self.stop_experiment_button.setEnabled(not enabled)
         for widget in (
-            self.fl_start_button, self.live_Button, self.record_button,
+            self.fl_start_button, self.initialize_chemostats_button,
+            self.live_Button, self.record_button,
             self.save_Position_button, self.replacePositionButton,
             self.clearButton, self.GoToPositionButton, self.Save_Exposures_button,
         ):
