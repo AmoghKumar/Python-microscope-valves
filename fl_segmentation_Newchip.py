@@ -1878,8 +1878,16 @@ class MicroscopeControlGUI(QMainWindow):
         init_area_row.setSpacing(8)
         init_area_row.addWidget(area_lbl)
         init_area_row.addWidget(self.init_desired_area_Input, 1)
-        init_area_row.addWidget(self.initialize_chemostats_button, 1)
         init_layout.addLayout(init_area_row)
+
+        self.fix_droplet_sizes_button = QPushButton("Fix Droplet Sizes")
+        self.fix_droplet_sizes_button.setStyleSheet(BTN_GREEN)
+        self.fix_droplet_sizes_button.clicked.connect(self.Fix_Droplet_Sizes)
+        init_btn_row = QHBoxLayout()
+        init_btn_row.setSpacing(8)
+        init_btn_row.addWidget(self.initialize_chemostats_button, 1)
+        init_btn_row.addWidget(self.fix_droplet_sizes_button, 1)
+        init_layout.addLayout(init_btn_row)
         right.addWidget(group("Initialize Chemostats", init_layout))
 
         # -- Voltage
@@ -2518,10 +2526,9 @@ class MicroscopeControlGUI(QMainWindow):
             purge_duration  = float(self.purge_duration_Input.text())
             flow_duration   = float(self.flow_duration_Input.text())
             drive_duration  = float(self.drive_duration_Input.text())
-            shrink_duration = float(self.Shrink_duration_Input.text())
         except ValueError:
             QMessageBox.warning(self, "Initialize chemostats",
-                                "Desired area and the purge / flow / drive / shrink "
+                                "Desired area and the purge / flow / drive "
                                 "durations must all be numbers.")
             return
         if desired_area <= 0:
@@ -2554,8 +2561,60 @@ class MicroscopeControlGUI(QMainWindow):
             purge_duration=purge_duration,
             flow_duration=flow_duration,
             drive_duration=drive_duration,
+        )
+
+    def Fix_Droplet_Sizes(self):
+        """
+        Fix Droplet Sizes button (GUI thread): validate and snapshot the
+        inputs, then image + shrink the ticked chemostats on a background
+        ExperimentWorker. Chemostat N is saved stage position N.
+        """
+        chemostats = [i + 1 for i, cb in enumerate(self.init_chem_checks) if cb.isChecked()]
+        if not chemostats:
+            QMessageBox.warning(self, "Fix droplet sizes",
+                                "Tick at least one chemostat to fix.")
+            return
+        try:
+            desired_area    = float(self.init_desired_area_Input.text())
+            shrink_duration = float(self.Shrink_duration_Input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Fix droplet sizes",
+                                "Desired area and the shrink duration must be numbers.")
+            return
+        if desired_area <= 0:
+            QMessageBox.warning(self, "Fix droplet sizes",
+                                "Desired droplet area must be greater than 0.")
+            return
+        positions_table = [list(p) for p in self.positions]
+        missing = [c for c in chemostats if c > len(positions_table)]
+        if missing:
+            QMessageBox.warning(
+                self, "Fix droplet sizes",
+                f"No saved stage position for chemostat(s) {missing} - chemostat N "
+                f"uses saved position N, and only {len(positions_table)} position(s) "
+                f"are saved.")
+            return
+        if not self.selected_exposures:
+            QMessageBox.warning(
+                self, "Fix droplet sizes",
+                "Droplet area is measured with the first row of the exposure table - "
+                "set a filter/exposure and click Save Values first.")
+            return
+        self._launch_experiment_worker(
+            self._fix_droplet_sizes_run,
+            chemostats=chemostats,
+            desired_area=desired_area,
+            positions_table=positions_table,
+            selected_exposures=[list(e) for e in self.selected_exposures],
             shrink_duration=shrink_duration,
         )
+
+    def _fix_droplet_sizes_run(self, **kwargs):
+        try:
+            self._fix_droplet_sizes_body(**kwargs)
+        except Exception:
+            self._safe_shutdown_valves()
+            raise
 
     def _initialize_chemostats_run(self, **kwargs):
         try:
@@ -2580,25 +2639,18 @@ class MicroscopeControlGUI(QMainWindow):
 
     def _initialize_chemostats_body(self, chemostats, inlet_1, inlet_2, desired_area,
                                     positions_table, selected_exposures,
-                                    purge_duration, flow_duration, drive_duration,
-                                    shrink_duration):
+                                    purge_duration, flow_duration, drive_duration):
         """
         1. Fill: for each ticked chemostat, run purge/generate/drive twice
            (DropletWorker "initialize").
         2. Measure + report: droplet area at EVERY saved position vs the
            desired area, in the log.
-        3. Shrink: for each ticked chemostat, one at a time (highest number
-           first), shrink and re-measure until its area is within +/-5% of
-           the desired area. Positions that weren't ticked are measured and
-           reported but never shrunk.
+        No shrinking here - use "Fix Droplet Sizes" for that.
         Measurement reuses _measure_chemostat_droplet_area (first row of the
         exposure table + segment_droplet_fl), and saves
-        Mask_/Raw_chemostat#_init_before and ..._init_round# files.
+        Mask_/Raw_chemostat#_init_before files.
         """
         TOL = 0.05
-        MAX_ROUNDS = 8
-        MIN_SHRINK_DURATION = 0.5
-        MAX_SHRINK_DURATION = 1.5 * shrink_duration
         lo, hi = desired_area * (1 - TOL), desired_area * (1 + TOL)
         chemostats = sorted(chemostats)
 
@@ -2617,16 +2669,47 @@ class MicroscopeControlGUI(QMainWindow):
 
         # 2. measure + report every saved position
         filt, exp = selected_exposures[0]
-        areas = {}
         print("Measuring droplet area at every saved position:")
         for pos_num in range(1, len(positions_table) + 1):
             if self._experiment_stop_requested:
                 raise ExperimentStopped()
-            areas[pos_num] = self._measure_chemostat_droplet_area(
+            area = self._measure_chemostat_droplet_area(
                 pos_num, positions_table, filt, exp, save_tag="init_before")
-            print(self._init_area_line(pos_num, areas[pos_num], desired_area, TOL))
+            print(self._init_area_line(pos_num, area, desired_area, TOL))
 
-        # 3. shrink each ticked chemostat until within tolerance
+    def _fix_droplet_sizes_body(self, chemostats, desired_area, positions_table,
+                                selected_exposures, shrink_duration):
+        """
+        1. Image: measure the droplet area at each ticked chemostat's
+           position and report it against the desired area.
+        2. Shrink: for each ticked chemostat that is too large, one at a
+           time (highest number first), shrink and re-measure until its area
+           is within +/-5% of the desired area. Ones already in range are
+           left alone; ones too small can't be grown back.
+        Saves Mask_/Raw_chemostat#_fix_before and ..._fix_round# files.
+        """
+        TOL = 0.05
+        MAX_ROUNDS = 8
+        MIN_SHRINK_DURATION = 0.5
+        MAX_SHRINK_DURATION = 1.5 * shrink_duration
+        lo, hi = desired_area * (1 - TOL), desired_area * (1 + TOL)
+        chemostats = sorted(chemostats)
+
+        print(f"=== Fix droplet sizes {chemostats}: desired area "
+              f"{desired_area:.0f} px (+/-{TOL*100:.0f}% = {lo:.0f}-{hi:.0f} px) ===")
+
+        # 1. image the ticked chemostats
+        filt, exp = selected_exposures[0]
+        areas = {}
+        print("Measuring droplet area at each selected chemostat:")
+        for chem_num in chemostats:
+            if self._experiment_stop_requested:
+                raise ExperimentStopped()
+            areas[chem_num] = self._measure_chemostat_droplet_area(
+                chem_num, positions_table, filt, exp, save_tag="fix_before")
+            print(self._init_area_line(chem_num, areas[chem_num], desired_area, TOL))
+
+        # 2. shrink each too-large chemostat until within tolerance
         for chem_num in sorted(chemostats, reverse=True):
             area = areas[chem_num]
             if lo <= area <= hi:
@@ -2647,7 +2730,7 @@ class MicroscopeControlGUI(QMainWindow):
                 sw = DropletWorker("shrink", chemostat_number=chem_num, shrink_duration=dur)
                 sw.start(); sw.wait()
                 area = self._measure_chemostat_droplet_area(
-                    chem_num, positions_table, filt, exp, save_tag=f"init_round{round_num}")
+                    chem_num, positions_table, filt, exp, save_tag=f"fix_round{round_num}")
                 areas[chem_num] = area
                 print(self._init_area_line(chem_num, area, desired_area, TOL))
                 if lo <= area <= hi:
@@ -2668,9 +2751,9 @@ class MicroscopeControlGUI(QMainWindow):
                 print(f"  WARNING: chemostat {chem_num} did not reach the range after "
                       f"{MAX_ROUNDS} rounds - moving on.")
 
-        print("=== Initialize chemostats: final areas ===")
-        for pos_num in sorted(areas):
-            print(self._init_area_line(pos_num, areas[pos_num], desired_area, TOL))
+        print("=== Fix droplet sizes: final areas ===")
+        for chem_num in sorted(areas):
+            print(self._init_area_line(chem_num, areas[chem_num], desired_area, TOL))
 
     def PWM_droplet(self, input_1=12, input_2=13):
         self.PWM_thread = DropletWorker(
@@ -2986,8 +3069,9 @@ class MicroscopeControlGUI(QMainWindow):
         the duration that - using the same observed rate - would have
         landed it right at the target, so later loops start from that
         calibrated duration instead of repeating the raw shrink_duration
-        and overshooting again. Since the rate estimate is linear, the
-        actual result can land within +/-0.01x of the target; that's fine.
+        and overshooting again. A ratio within target +/- 0.01x (e.g.
+        0.84x-0.86x for a 0.85x target) counts as on target: it ends the
+        chemostat's shrinking and is not treated as an overshoot.
 
         Each round's area measurement is saved as Mask_chemostat#_cycle#,
         tagged by loop_num (the caller's time-interval/loop number), not by
@@ -3001,6 +3085,7 @@ class MicroscopeControlGUI(QMainWindow):
         MIN_SHRINK_DURATION = 0.5
         MAX_SHRINK_DURATION = 1.5 * shrink_duration  # guards against runaway extrapolation from a tiny/noisy drop
         SUSPECT_RATIO = 1.5
+        TARGET_TOL = 0.01   # a ratio within target +/- 0.01 counts as on target
 
         target_ratio = float(self.shrink_target_ratio_Input.text())
         if not selected_exposures:
@@ -3068,7 +3153,7 @@ class MicroscopeControlGUI(QMainWindow):
                     chem_num, positions_table, filt, exp, save_tag=f"cycle{loop_num}")
                 ratio   = area / initial if initial > 0 else 1.0
                 print(f"  Chemostat {chem_num} shrink round {round_num}: "
-                      f"ratio={ratio:.3f} (target {target_ratio})")
+                      f"ratio={ratio:.3f} (target {target_ratio} +/- {TARGET_TOL})")
                 if ratio > SUSPECT_RATIO:
                     # A shrinking droplet can't end up far bigger than its
                     # baseline - this is a bad frame/measurement, and
@@ -3090,9 +3175,9 @@ class MicroscopeControlGUI(QMainWindow):
                               f"Mask_chemostat{chem_num}_cycle{loop_num}_suspect.png / "
                               f"Raw_chemostat{chem_num}_cycle{loop_num}_suspect.tiff.")
                         continue
-                if ratio <= target_ratio:
+                if ratio <= target_ratio + TARGET_TOL:
                     print(f"  Chemostat {chem_num}: reached target after {round_num} round(s).")
-                    if ratio < target_ratio and round_num == 1:
+                    if ratio < target_ratio - TARGET_TOL and round_num == 1:
                         # Overshot on the very first shrink of this time
                         # interval - the duration just used (`used_dur`) shrank
                         # it from prev_ratio (1.0) to ratio, i.e. rate =
@@ -4440,7 +4525,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.stop_experiment_button.setEnabled(not enabled)
         for widget in (
             self.fl_start_button, self.initialize_chemostats_button,
-            self.live_Button, self.record_button,
+            self.fix_droplet_sizes_button, self.live_Button, self.record_button,
             self.save_Position_button, self.replacePositionButton,
             self.clearButton, self.GoToPositionButton, self.Save_Exposures_button,
         ):
