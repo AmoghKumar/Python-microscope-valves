@@ -595,6 +595,15 @@ def droplet_fluorescence(raw_fl: np.ndarray, mask: np.ndarray):
 
 # Trigger a feed when droplet area drops below this fraction of initial
 FL_AREA_THRESHOLD = 0.80
+# Synthesis mode waits for a deeper shrink, then feeds several droplets
+# back-to-back in that one cycle before the position switches to Maintain.
+FL_SYNTH_AREA_THRESHOLD = 0.40
+FL_SYNTH_FEED_COUNT     = 3
+
+
+def fl_area_threshold(mode) -> float:
+    """Shrink fraction of initial area that triggers a feed in `mode`."""
+    return FL_SYNTH_AREA_THRESHOLD if mode == MODE_SYNTH else FL_AREA_THRESHOLD
 
 
 Microscope = {}
@@ -2113,16 +2122,22 @@ class MicroscopeControlGUI(QMainWindow):
             "    Synthesis or Maintain are also imaged with the other rows\n"
             "  • Droplet segmented via Otsu threshold + electrode bridge\n"
             f"  • Chemostat triggered if area < "
-            f"{FL_AREA_THRESHOLD * 100:.0f}% of initial area\n\n"
+            f"{FL_AREA_THRESHOLD * 100:.0f}% of initial area "
+            f"({FL_SYNTH_AREA_THRESHOLD * 100:.0f}% in Synthesis)\n\n"
             "Only the positions ticked below are fed. Each starts in\n"
             "Upconcentration mode and is fed from the Upconcentration inlets.\n"
             "Droplet fluorescence (median inside mask − median outside) is\n"
-            "measured each round; once it exceeds the position's own\n"
-            "Up-concentration Factor (F1-F3, picked next to its tick box)\n"
-            "× initial, the position switches to Synthesis: its next\n"
-            "replenishment uses the Synthesis inlets, after which it switches\n"
-            "to Maintain and is fed from the Maintain inlet for the rest of\n"
-            "the experiment. Two inlets are mixed into one droplet.\n\n"
+            "measured each round. Real up-concentration = (fluorescence /\n"
+            "initial fluorescence) × (area / initial area), i.e. referenced\n"
+            "to the droplet at 1x its initial size. Once it reaches the\n"
+            "position's own Up-concentration Factor (F1-F3, picked next to\n"
+            "its tick box), the position switches to Synthesis: it waits until\n"
+            f"its area drops below {FL_SYNTH_AREA_THRESHOLD * 100:.0f}% of initial, "
+            f"then gets {FL_SYNTH_FEED_COUNT}\n"
+            "Synthesis-inlet droplets back-to-back in that cycle, after which\n"
+            "it switches to Maintain and is fed from the Maintain inlet\n"
+            f"(at the usual {FL_AREA_THRESHOLD * 100:.0f}% trigger) for the rest of "
+            "the experiment.\nTwo inlets are mixed into one droplet.\n\n"
             "Each position tracks its own loop counter independently.\n"
             "Set imaging interval, total duration and Up-concentration\n"
             "Factors F1-F3 in the Timing panel."
@@ -2398,14 +2413,20 @@ class MicroscopeControlGUI(QMainWindow):
 
     def _fl_update_fluorescence(self, idx, raw_fl, mask, tick_number,
                                 time_tag_min, fluo_values, pos_mode,
-                                upconc_factors, fluo_csv):
+                                upconc_factors, fluo_csv, area_frac):
         """
         Measure droplet fluorescence for one position, store it in
         fluo_values as Fluo_Pos#_initial (tick 1) or Fluo_Pos#_##min, append
         it to fluo_csv, and switch an addressed position (one in pos_mode)
-        from Upconcentration to Synthesis once
-        Fluo_Pos#_##min / Fluo_Pos#_initial exceeds that position's factor
-        in upconc_factors.
+        from Upconcentration to Synthesis once the real up-concentration
+        reaches that position's factor in upconc_factors.
+
+        The fluorescence ratio Fluo_Pos#_##min / Fluo_Pos#_initial is
+        measured on a droplet that has shrunk to area_frac of its initial
+        area, so it overstates the concentration of a full-size droplet.
+        The real up-concentration, referenced to 1x initial size, is
+            ratio × area_frac
+        e.g. a 5x ratio at 0.8x initial size is really 4x.
         """
         pos_num  = idx + 1
         init_key = f"Fluo_Pos{pos_num}_initial"
@@ -2428,17 +2449,25 @@ class MicroscopeControlGUI(QMainWindow):
                 print(f"  Pos {pos_num}: {init_key} = {initial:.1f} <= 0 - "
                       f"cannot compute up-concentration ratio")
 
+        real_upconc = None
+        if ratio is not None and area_frac is not None:
+            real_upconc = ratio * area_frac
+
         print(f"  Pos {pos_num}: {key} = {fluo:.1f}  "
               f"(in {med_in:.1f} - out {med_out:.1f})"
               + (f"  ratio {ratio:.2f}" if ratio is not None else "")
-              + (f" / factor {factor:g}" if ratio is not None and factor else ""))
+              + (f" x size {area_frac:.2f} = real {real_upconc:.2f}"
+                 if real_upconc is not None else "")
+              + (f" / factor {factor:g}" if real_upconc is not None and factor else ""))
 
-        if (ratio is not None and factor is not None and ratio > factor
+        if (real_upconc is not None and factor is not None
+                and real_upconc >= factor
                 and pos_mode.get(idx) == MODE_UPCONC):
             pos_mode[idx] = MODE_SYNTH
             self._fl_status(
                 f"Pos {pos_num} -> SYNTHESIS mode "
-                f"(ratio {ratio:.2f} > {factor:g})")
+                f"(real up-concentration {real_upconc:.2f} = ratio {ratio:.2f} "
+                f"x size {area_frac:.2f} >= {factor:g})")
             self._fl_report_modes(pos_mode)
 
         with open(fluo_csv, "a", newline="") as f:
@@ -2448,6 +2477,8 @@ class MicroscopeControlGUI(QMainWindow):
                 "" if ratio is None else f"{ratio:.4f}",
                 "" if factor is None else factor,
                 pos_mode.get(idx, "not addressed"),
+                "" if area_frac is None else f"{area_frac:.4f}",
+                "" if real_upconc is None else f"{real_upconc:.4f}",
             ])
 
     def _fl_feed_droplet(self, rn, inlets, positions, flow_dur, drive_dur):
@@ -2607,17 +2638,19 @@ class MicroscopeControlGUI(QMainWindow):
              recorded as Fluo_Pos#_initial on tick 1 and Fluo_Pos#_##min
              afterwards, logged to <base>/fluorescence_upconcentration.csv.
              Every addressed position starts in Upconcentration mode; once
-             Fluo_Pos#_##min / Fluo_Pos#_initial > its own factor
-             (upconc_factors, chosen per position from F1-F3) it switches
-             to Synthesis mode.
-          5. From tick 2 onwards, if an addressed position's
-             area < AREA_THRESHOLD × initial, it gets one droplet generated
-             from its current mode's inlets (mode_inlets; a pair is opened
-             together) and its loop counter increments:
-               – Upconcentration: Upconcentration inlets.
-               – Synthesis: Synthesis inlets once, then the position
-                 switches to Maintain for the rest of the experiment.
-               – Maintain: Maintain inlet.
+             the real up-concentration, (Fluo_Pos#_##min / Fluo_Pos#_initial)
+             × (area / initial area), reaches its own factor (upconc_factors,
+             chosen per position from F1-F3) it switches to Synthesis mode.
+          5. From tick 2 onwards, if an addressed position's area drops below
+             its mode's threshold × initial (FL_AREA_THRESHOLD, or
+             FL_SYNTH_AREA_THRESHOLD in Synthesis), it is fed from its current
+             mode's inlets (mode_inlets; a pair is opened together) and its
+             loop counter increments:
+               – Upconcentration: one Upconcentration droplet.
+               – Synthesis: FL_SYNTH_FEED_COUNT Synthesis droplets
+                 back-to-back in that cycle, then the position switches to
+                 Maintain for the rest of the experiment.
+               – Maintain: one Maintain droplet.
 
         Folder / file naming
         ────────────────────
@@ -2667,6 +2700,7 @@ class MicroscopeControlGUI(QMainWindow):
                     "name", "position", "time_min", "median_inside",
                     "median_outside", "fluo", "ratio_to_initial",
                     "upconc_factor", "mode",
+                    "area_fraction", "real_upconc",
                 ])
 
         # Initialise valves
@@ -2760,10 +2794,12 @@ class MicroscopeControlGUI(QMainWindow):
                 cv2.imwrite(os.path.join(fl_dir, overlay_fname), seg_overlay)
                 time.sleep(0.2)
 
-                # Droplet fluorescence → Upconcentration/Synthesis switch
+                # Droplet fluorescence → Upconcentration/Synthesis switch,
+                # judged on the real up-concentration (ratio × size).
+                area_frac = seg_area / initial if initial > 0 else None
                 self._fl_update_fluorescence(
                     idx, raw_fl, seg_mask, tick_number, time_tag_min,
-                    fluo_values, pos_mode, upconc_factors, fluo_csv)
+                    fluo_values, pos_mode, upconc_factors, fluo_csv, area_frac)
 
                 # Record initial area on the very first tick
                 if tick_number == 1:
@@ -2771,18 +2807,22 @@ class MicroscopeControlGUI(QMainWindow):
                     print(f"  Pos {pos_num}: initial area recorded = {seg_area} px")
                 else:
                     ratio = seg_area / initial if initial > 0 else 1.0
+                    # Synthesis waits for a deeper shrink (0.4x) than the
+                    # other modes (0.8x); uses the mode after this round's
+                    # fluorescence check.
+                    threshold = fl_area_threshold(pos_mode.get(idx))
                     print(
                         f"  Pos {pos_num}  Loop {pos_loop}: "
                         f"area = {seg_area} px  ({ratio * 100:.1f}% of initial  "
-                        f"[threshold {FL_AREA_THRESHOLD * 100:.0f}%])"
+                        f"[threshold {threshold * 100:.0f}%])"
                     )
                     if (idx in pos_mode and initial > 0
-                            and seg_area < FL_AREA_THRESHOLD * initial):
+                            and seg_area < threshold * initial):
                         triggered_positions.append(idx)
                         self._fl_status(
                             f"⚠ Pos {pos_num} TRIGGERED "
                             f"({ratio * 100:.1f}% < "
-                            f"{FL_AREA_THRESHOLD * 100:.0f}%)"
+                            f"{threshold * 100:.0f}%)"
                         )
 
                 # ── Synthesis / Maintain: also image the remaining rows ────
@@ -2853,17 +2893,22 @@ class MicroscopeControlGUI(QMainWindow):
                     pw = DropletWorker("purge", inlets=inlets, purge_duration=purge_dur)
                     pw.start(); pw.wait()
 
+                    # Synthesis: FL_SYNTH_FEED_COUNT droplets back-to-back
+                    # in this cycle, then the position switches to Maintain.
+                    n_feeds = FL_SYNTH_FEED_COUNT if mode == MODE_SYNTH else 1
                     for rn in group_idx:
-                        if self._experiment_stop_requested:
-                            raise ExperimentStopped()
-                        self._fl_status(
-                            f"{mode} feed – Pos {rn + 1}  "
-                            f"inlet(s) {'+'.join(map(str, inlets))}")
-                        self._fl_feed_droplet(rn, inlets, positions,
-                                              flow_dur, drive_dur)
+                        for k in range(n_feeds):
+                            if self._experiment_stop_requested:
+                                raise ExperimentStopped()
+                            self._fl_status(
+                                f"{mode} feed – Pos {rn + 1}  "
+                                f"inlet(s) {'+'.join(map(str, inlets))}"
+                                + (f"  ({k + 1}/{n_feeds})" if n_feeds > 1 else ""))
+                            self._fl_feed_droplet(rn, inlets, positions,
+                                                  flow_dur, drive_dur)
                         if mode == MODE_SYNTH:
                             pos_mode[rn] = MODE_MAINTAIN
-                            print(f"  Pos {rn + 1}: synthesis feed done "
+                            print(f"  Pos {rn + 1}: {n_feeds} synthesis feeds done "
                                   f"-> MAINTAIN mode")
 
                     self._fl_flush_buffer()
