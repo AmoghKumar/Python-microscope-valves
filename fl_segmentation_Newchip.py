@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QRadioButton, QFrame, QSpinBox, QLineEdit, QCheckBox, QPushButton,
     QLabel, QHBoxLayout, QVBoxLayout, QComboBox, QWidget, QTableWidget,
     QTableWidgetItem, QMessageBox, QInputDialog, QGridLayout, QSizePolicy,
-    QGroupBox, QSplitter, QPlainTextEdit, QDialog
+    QGroupBox, QSplitter, QPlainTextEdit, QDialog, QSlider
 )
 from PyQt5.QtGui import QPixmap, QImage, QFont
 from PyQt5.QtCore import QTimer, pyqtSignal, pyqtSlot, Qt, QThread, QSize
@@ -932,6 +932,7 @@ class _ExperimentBridge(QtCore.QObject):
     live_button_reset   = pyqtSignal()
     error_dialog        = pyqtSignal(str, str)    # title, message
     verify_masks_requested = pyqtSignal(dict)     # {chemostat_number: mask_png_path}
+    image_ready         = pyqtSignal(np.ndarray)  # raw uint16 snap to show in the viewer
 
 
 # ─────────────────────────────────────────────
@@ -1069,8 +1070,9 @@ class VideoThread(QThread):
             self._lock.unlock()
 
     def convert_raw_np(self, raw_img, img_width, img_height, pixel_Type):
-        rawImage = np.frombuffer(raw_img, dtype=pixel_Type).reshape((img_height, img_width)).T
-        return exposure.rescale_intensity(rawImage)
+        # Raw counts: the viewer applies its own brightness/contrast window
+        # (recording rescales separately, from the image's own min/max).
+        return np.frombuffer(raw_img, dtype=pixel_Type).reshape((img_height, img_width)).T
 
     def start_recording(self):
         # FIX: set flag under lock so the run loop sees a consistent state
@@ -1426,6 +1428,18 @@ class MicroscopeControlGUI(QMainWindow):
         self.shrink_auto_mode = False   # Manual is the default mode
         self.interval_per_chemostat = {}      # {chem_num: 1|2|3}, Timelapse Experiment only
         self.shrink_mode_per_chemostat = {}   # {chem_num: bool} - overrides shrink_auto_mode per chemostat
+        # Viewer brightness/contrast (display only - never touches saved data).
+        # _last_raw is the unmodified frame currently shown. While
+        # _bc_manual is False the view auto-stretches min..max per image;
+        # once a slider/Auto sets a window it stays at [_bc_min, _bc_max]
+        # (absolute camera counts) for later snaps and live frames.
+        # _bc_full is the count range the two sliders span.
+        self._last_raw   = None
+        self._bc_manual  = False
+        self._bc_min     = 0.0
+        self._bc_max     = 1.0
+        self._bc_full    = (0.0, 1.0)
+        self._bc_syncing = False
         self._init_microscope()
         self._build_ui()
         self.setWindowTitle('Microscope Control')
@@ -1450,6 +1464,7 @@ class MicroscopeControlGUI(QMainWindow):
         self._exp_bridge.error_dialog.connect(self._on_error_dialog)
         self._exp_bridge.verify_masks_requested.connect(self._on_verify_masks_requested)
         self._mask_verify_approved = None   # None = pending, True/False = answered
+        self._exp_bridge.image_ready.connect(self._on_snap_image_ready)
 
     @pyqtSlot(int, bool)
     def _on_valve_style_changed(self, idx, state):
@@ -1717,6 +1732,36 @@ class MicroscopeControlGUI(QMainWindow):
         viewer_layout.setSpacing(4)
         viewer_layout.addLayout(cap_layout)
         viewer_layout.addWidget(self.image_Live, 1)
+
+        # -- Display brightness / contrast (ImageJ-style, viewer only: saved
+        #    images and experiment data are never rescaled by these)
+        self.brightness_slider = QSlider(Qt.Horizontal)
+        self.contrast_slider   = QSlider(Qt.Horizontal)
+        for sl, start in ((self.brightness_slider, self.BC_BRIGHTNESS_DEFAULT),
+                          (self.contrast_slider,   self.BC_CONTRAST_DEFAULT)):
+            sl.setRange(0, self.BC_SLIDER_MAX)
+            sl.setValue(start)
+            sl.valueChanged.connect(self._on_bc_slider_changed)
+        self.bc_auto_button  = QPushButton("Auto")
+        self.bc_reset_button = QPushButton("Reset")
+        for btn in (self.bc_auto_button, self.bc_reset_button):
+            btn.setStyleSheet(BTN_GREY)
+        self.bc_auto_button.clicked.connect(self.auto_brightness_contrast)
+        self.bc_reset_button.clicked.connect(self.reset_brightness_contrast)
+        self.bc_range_label = QLabel("Display: auto")
+        self.bc_range_label.setStyleSheet("color:#aaa;")
+        bc_grid = QGridLayout()
+        bc_grid.setSpacing(4)
+        for row, (text, sl) in enumerate((("Brightness", self.brightness_slider),
+                                          ("Contrast",   self.contrast_slider))):
+            lbl = QLabel(text); lbl.setStyleSheet("color:#aaa;")
+            bc_grid.addWidget(lbl, row, 0)
+            bc_grid.addWidget(sl,  row, 1)
+        bc_grid.addWidget(self.bc_auto_button,  0, 2)
+        bc_grid.addWidget(self.bc_reset_button, 1, 2)
+        bc_grid.addWidget(self.bc_range_label,  2, 0, 1, 3)
+        bc_grid.setColumnStretch(1, 1)
+        viewer_layout.addLayout(bc_grid)
         left.addWidget(group("Image Viewer", viewer_layout), 1)
 
         ''' # -- Stage controls
@@ -2285,11 +2330,8 @@ class MicroscopeControlGUI(QMainWindow):
         image_height = self.mmc.getImageHeight()
 
         rawImage = np.frombuffer(rawImage, dtype=np.uint16).reshape((image_height, image_width)).T
-        self.adjusted_image = exposure.rescale_intensity(rawImage)
-        raw_data = self.adjusted_image.tobytes()
-        self.myQImage = QImage(raw_data, image_width, image_height, QImage.Format_Grayscale16)
-        self.image_Live.setPixmap(QPixmap.fromImage(self.myQImage).scaled(
-            self.image_Live.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        # Display only (brightness/contrast window); rawImage itself is returned untouched.
+        self._exp_bridge.image_ready.emit(np.array(rawImage))
         return rawImage      # ← add this one line
 
     def snap_EPI_image(self, Filter, Exposure_value):
@@ -2307,16 +2349,140 @@ class MicroscopeControlGUI(QMainWindow):
         image_height = self.mmc.getImageHeight()
 
         rawImage = np.frombuffer(rawImage, dtype=np.uint16).reshape((image_height, image_width)).T
-        # No rescaling: display and save the camera counts exactly as read.
-        raw_data = rawImage.tobytes()
-        self.myQImage = QImage(raw_data, image_width, image_height, QImage.Format_Grayscale16)
+        # The saved file is the camera counts exactly as read; the viewer
+        # applies its own brightness/contrast window on top of a copy.
         tiff.imwrite('C:\\Users\\Cell Culture Scope\\Pictures\\image_raw.tiff', rawImage)
-        self.image_Live.setPixmap(QPixmap.fromImage(self.myQImage).scaled(
-            self.image_Live.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self._exp_bridge.image_ready.emit(np.array(rawImage))
         return rawImage
 
+    # ── Viewer brightness / contrast (display only) ──────────
+    # Brightness slides the display window's centre across the current
+    # image's count range (right = brighter = window moves down); Contrast
+    # narrows the window's width (right = higher contrast), log-spaced over
+    # BC_CONTRAST_DECADES decades so a dim fluorescence signal can be
+    # stretched far. Defaults (brightness mid, contrast 0) = full min..max.
+    BC_SLIDER_MAX         = 1000
+    BC_BRIGHTNESS_DEFAULT = 500
+    BC_CONTRAST_DEFAULT   = 0
+    BC_CONTRAST_DECADES   = 3.0
+
+    @staticmethod
+    def _imagej_auto_window(raw):
+        """
+        ImageJ's Brightness/Contrast "Auto": on a 256-bin histogram over the
+        image's min..max, ignore bins holding more than 10% of the pixels
+        (the dominant background) and take the first/last bin holding more
+        than 1/5000 of the pixels as the display min/max.
+        """
+        dmin, dmax = float(raw.min()), float(raw.max())
+        if dmax <= dmin:
+            return dmin, dmin + 1.0
+        hist, _ = np.histogram(raw, bins=256, range=(dmin, dmax))
+        bin_size = (dmax - dmin) / 256.0
+        limit     = raw.size // 10
+        threshold = raw.size // 5000
+        counts = np.where(hist > limit, 0, hist)
+        found = np.nonzero(counts > threshold)[0]
+        if found.size == 0:
+            return dmin, dmax
+        lo = dmin + found[0] * bin_size
+        hi = dmin + found[-1] * bin_size
+        if hi <= lo:
+            return dmin, dmax
+        return lo, hi
+
+    def _bc_window(self, raw):
+        if self._bc_manual:
+            return self._bc_min, self._bc_max
+        lo, hi = float(raw.min()), float(raw.max())
+        return lo, (hi if hi > lo else lo + 1.0)
+
+    def _bc_window_from_sliders(self):
+        lo, hi = self._bc_full
+        rng = max(hi - lo, 1.0)
+        b = self.brightness_slider.value() / self.BC_SLIDER_MAX
+        c = self.contrast_slider.value()   / self.BC_SLIDER_MAX
+        width  = max(rng * 10.0 ** (-self.BC_CONTRAST_DECADES * c), 1.0)
+        center = hi - rng * b
+        return center - width / 2.0, center + width / 2.0
+
+    def _bc_sync_sliders(self):
+        """Move the sliders to match the current absolute window (no feedback)."""
+        lo, hi = self._bc_full
+        rng = max(hi - lo, 1.0)
+        width  = max(self._bc_max - self._bc_min, 1.0)
+        center = (self._bc_min + self._bc_max) / 2.0
+        b = (hi - center) / rng
+        c = np.log10(rng / width) / self.BC_CONTRAST_DECADES
+        self._bc_syncing = True
+        try:
+            self.brightness_slider.setValue(int(round(min(max(b, 0.0), 1.0) * self.BC_SLIDER_MAX)))
+            self.contrast_slider.setValue(int(round(min(max(c, 0.0), 1.0) * self.BC_SLIDER_MAX)))
+        finally:
+            self._bc_syncing = False
+
+    def _render_display(self, raw):
+        """Show raw counts through the current window. Never modifies raw."""
+        lo, hi = self._bc_window(raw)
+        scaled = np.clip((raw.astype(np.float32) - lo) / (hi - lo), 0.0, 1.0)
+        img16 = np.ascontiguousarray((scaled * 65535.0).astype(np.uint16))
+        h, w = img16.shape
+        qimg = QImage(img16.tobytes(), w, h, 2 * w, QImage.Format_Grayscale16)
+        self.myQImage = qimg.copy()
+        self.image_Live.setPixmap(QPixmap.fromImage(self.myQImage).scaled(
+            self.image_Live.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        text = (f"Display: {lo:.0f} - {hi:.0f} counts" if self._bc_manual
+                else f"Display: auto ({lo:.0f} - {hi:.0f} counts)")
+        if self.bc_range_label.text() != text:
+            self.bc_range_label.setText(text)
+
+    def _show_raw(self, raw, is_snap):
+        self._last_raw = raw
+        # Auto-follow mode tracks every frame's own range; a manual window
+        # only re-bases the sliders on snaps (live frames would make them jitter).
+        if not self._bc_manual or is_snap:
+            self._bc_full = (float(raw.min()), float(raw.max()))
+            if self._bc_manual:
+                self._bc_sync_sliders()
+        self._render_display(raw)
+
+    @pyqtSlot(np.ndarray)
+    def _on_snap_image_ready(self, raw):
+        self._show_raw(raw, is_snap=True)
+
+    def _on_bc_slider_changed(self, _value=None):
+        if self._bc_syncing or self._last_raw is None:
+            return
+        self._bc_manual = True
+        self._bc_min, self._bc_max = self._bc_window_from_sliders()
+        self._render_display(self._last_raw)
+
+    def auto_brightness_contrast(self):
+        if self._last_raw is None:
+            return
+        raw = self._last_raw
+        self._bc_full = (float(raw.min()), float(raw.max()))
+        self._bc_min, self._bc_max = self._imagej_auto_window(raw)
+        self._bc_manual = True
+        self._bc_sync_sliders()
+        self._render_display(raw)
+
+    def reset_brightness_contrast(self):
+        self._bc_manual = False
+        self._bc_syncing = True
+        try:
+            self.brightness_slider.setValue(self.BC_BRIGHTNESS_DEFAULT)
+            self.contrast_slider.setValue(self.BC_CONTRAST_DEFAULT)
+        finally:
+            self._bc_syncing = False
+        if self._last_raw is not None:
+            self._bc_full = (float(self._last_raw.min()), float(self._last_raw.max()))
+            self._render_display(self._last_raw)
+
     def save_image(self):
-        if not self.image_Live.pixmap():
+        # Saves the unmodified camera frame (16-bit PNG), never the
+        # brightness/contrast-adjusted view that's on screen.
+        if self._last_raw is None:
             print("No image to save")
             return
 
@@ -2329,18 +2495,14 @@ class MicroscopeControlGUI(QMainWindow):
             self.directory_input.setText(folder)
 
         self.image_path = os.path.join(folder, "image.png")
-        self.image_Live.pixmap().save(self.image_path)
+        Image.fromarray(np.ascontiguousarray(self._last_raw)).save(self.image_path)
         print(f"Image saved to {self.image_path}")
 
 
 
     @pyqtSlot(np.ndarray)
     def update_image(self, cv_img):
-        h, w = cv_img.shape
-        raw_data = cv_img.tobytes()
-        qimg = QImage(raw_data, w, h, QImage.Format_Grayscale16)
-        self.image_Live.setPixmap(QPixmap.fromImage(qimg).scaled(
-            self.image_Live.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self._show_raw(cv_img, is_snap=False)
 
     def DIAlamp_ON(self):
         if self.dialamponlight.isChecked():
