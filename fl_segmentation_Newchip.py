@@ -1068,9 +1068,8 @@ class VideoThread(QThread):
             self._lock.unlock()
 
     def convert_raw_np(self, raw_img, img_width, img_height, pixel_Type):
-        # Raw counts: the viewer applies its own brightness/contrast window
-        # (recording rescales separately, from the image's own min/max).
-        return np.frombuffer(raw_img, dtype=pixel_Type).reshape((img_height, img_width)).T
+        rawImage = np.frombuffer(raw_img, dtype=pixel_Type).reshape((img_height, img_width)).T
+        return exposure.rescale_intensity(rawImage)
 
     def start_recording(self):
         # FIX: set flag under lock so the run loop sees a consistent state
@@ -1384,13 +1383,15 @@ class MicroscopeControlGUI(QMainWindow):
         self.current_protocol_table_step = 0
         self._experiment_stop_requested = False
         self._exp_worker = None
-        # Viewer brightness/contrast (display only - never touches saved data).
-        # _last_raw is the unmodified frame currently shown. While
-        # _bc_manual is False the view auto-stretches min..max per image;
-        # once a slider/Auto sets a window it stays at [_bc_min, _bc_max]
-        # (absolute camera counts) for later snaps and live frames.
-        # _bc_full is the count range the two sliders span.
+        # Viewer brightness/contrast (display only - never touches saved data,
+        # and never touches the live video, only snapped images).
+        # _last_raw is the unmodified last snapped frame. While _bc_manual is
+        # False the snap view auto-stretches min..max per image; once a
+        # slider/Auto sets a window it stays at [_bc_min, _bc_max] (absolute
+        # camera counts) for later snaps. _bc_full is the count range the two
+        # sliders span. _display_is_snap: viewer is showing a snap (vs live).
         self._last_raw   = None
+        self._display_is_snap = False
         self._bc_manual  = False
         self._bc_min     = 0.0
         self._bc_max     = 1.0
@@ -2243,26 +2244,26 @@ class MicroscopeControlGUI(QMainWindow):
         if self.bc_range_label.text() != text:
             self.bc_range_label.setText(text)
 
-    def _show_raw(self, raw, is_snap):
-        self._last_raw = raw
-        # Auto-follow mode tracks every frame's own range; a manual window
-        # only re-bases the sliders on snaps (live frames would make them jitter).
-        if not self._bc_manual or is_snap:
-            self._bc_full = (float(raw.min()), float(raw.max()))
-            if self._bc_manual:
-                self._bc_sync_sliders()
-        self._render_display(raw)
+    def _refresh_snap_display(self):
+        # Only ever redraws a snapped image - never replaces a live frame.
+        if self._display_is_snap and self._last_raw is not None:
+            self._render_display(self._last_raw)
 
     @pyqtSlot(np.ndarray)
     def _on_snap_image_ready(self, raw):
-        self._show_raw(raw, is_snap=True)
+        self._last_raw = raw
+        self._display_is_snap = True
+        self._bc_full = (float(raw.min()), float(raw.max()))
+        if self._bc_manual:
+            self._bc_sync_sliders()
+        self._render_display(raw)
 
     def _on_bc_slider_changed(self, _value=None):
         if self._bc_syncing or self._last_raw is None:
             return
         self._bc_manual = True
         self._bc_min, self._bc_max = self._bc_window_from_sliders()
-        self._render_display(self._last_raw)
+        self._refresh_snap_display()
 
     def auto_brightness_contrast(self):
         if self._last_raw is None:
@@ -2272,7 +2273,7 @@ class MicroscopeControlGUI(QMainWindow):
         self._bc_min, self._bc_max = self._imagej_auto_window(raw)
         self._bc_manual = True
         self._bc_sync_sliders()
-        self._render_display(raw)
+        self._refresh_snap_display()
 
     def reset_brightness_contrast(self):
         self._bc_manual = False
@@ -2284,12 +2285,14 @@ class MicroscopeControlGUI(QMainWindow):
             self._bc_syncing = False
         if self._last_raw is not None:
             self._bc_full = (float(self._last_raw.min()), float(self._last_raw.max()))
-            self._render_display(self._last_raw)
+            self._refresh_snap_display()
 
     def save_image(self):
-        # Saves the unmodified camera frame (16-bit PNG), never the
-        # brightness/contrast-adjusted view that's on screen.
-        if self._last_raw is None:
+        # A snapped image is saved as the unmodified camera frame (16-bit
+        # PNG), never the brightness/contrast-adjusted view. A live frame
+        # (not affected by those settings) is saved as displayed.
+        saving_snap = self._display_is_snap and self._last_raw is not None
+        if not saving_snap and not self.image_Live.pixmap():
             print("No image to save")
             return
 
@@ -2302,14 +2305,24 @@ class MicroscopeControlGUI(QMainWindow):
             self.directory_input.setText(folder)
 
         self.image_path = os.path.join(folder, "image.png")
-        Image.fromarray(np.ascontiguousarray(self._last_raw)).save(self.image_path)
+        if saving_snap:
+            Image.fromarray(np.ascontiguousarray(self._last_raw)).save(self.image_path)
+        else:
+            self.image_Live.pixmap().save(self.image_path)
         print(f"Image saved to {self.image_path}")
 
 
 
     @pyqtSlot(np.ndarray)
     def update_image(self, cv_img):
-        self._show_raw(cv_img, is_snap=False)
+        # Live video display: independent of the viewer's brightness/contrast
+        # (those apply to snapped images only).
+        self._display_is_snap = False
+        h, w = cv_img.shape
+        raw_data = cv_img.tobytes()
+        qimg = QImage(raw_data, w, h, QImage.Format_Grayscale16)
+        self.image_Live.setPixmap(QPixmap.fromImage(qimg).scaled(
+            self.image_Live.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def DIAlamp_ON(self):
         if self.dialamponlight.isChecked():
