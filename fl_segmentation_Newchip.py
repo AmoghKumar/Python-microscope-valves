@@ -340,7 +340,7 @@ def segment_droplet_fl(
     raw_fl: np.ndarray,
     min_component_area: int = 50,
     max_electrode_gap: int = 50,
-    min_area_ratio: float = 0.02,
+    min_area_ratio: float = 0.01,
 ) -> tuple:
     """
     Segment a droplet from a raw uint16 fluorescence image.
@@ -386,10 +386,13 @@ def segment_droplet_fl(
     min_area_ratio : float
         Candidates smaller than this fraction of the largest component's
         area are discarded outright before the proximity check (default
-        0.02, i.e. 2%).  This is what actually stops small stray droplets
+        0.01, i.e. 1%).  This is what actually stops small stray droplets
         or debris: they're typically well under 1% of the main droplet's
-        area, while a genuine secondary fragment left by another electrode
-        band is a much larger share (~3%+ in practice).  Without this gate,
+        area.  A genuine secondary fragment on the far side of an electrode
+        band can be dim and thin - the Otsu cut of one measured sliver was
+        only ~1.4-1.8% of the main body - so the gate is 1%, not the old 2%
+        which discarded those slivers and left a chunk of droplet out of
+        the mask (their half-max edge is recovered by step 4b).  Without this gate,
         a chain of many small-but-not-tiny noise specks can still bootstrap
         itself: each accepted speck grows the bounding box a little,
         making the next speck's gap easier to satisfy.
@@ -415,7 +418,7 @@ def segment_droplet_fl(
     #    smears isolated noise pixels below the Otsu cut while leaving the
     #    droplet's large, spatially coherent bright regions intact.
     blurred = cv2.GaussianBlur(norm, (9, 9), 0)
-    _, binary = cv2.threshold(blurred, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    otsu_t, binary = cv2.threshold(blurred, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     # 3. Collect all components above the noise floor
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
@@ -495,12 +498,50 @@ def segment_droplet_fl(
                 still_remaining.append((area, i))
         remaining = still_remaining
 
-    # 5. Convex hull over all bright pixels from kept components.
-    #    Wrapping the combined point cloud in a convex hull fills the dark
-    #    electrode bands and any horizontal offset between halves in one step.
+    # 4b. A fragment on the far side of an electrode band is much dimmer than
+    #     the main body (the band shadows it), so the global Otsu cut only
+    #     catches its brightest core. Grow each such fragment out to its own
+    #     half-max edge: the connected region of pixels above the midpoint
+    #     between background and the Otsu level. A grown region that would
+    #     touch the main body (bridging through electrode glow) or is bigger
+    #     than the main body is ignored and the plain Otsu fragment is kept.
     all_bright = np.zeros_like(binary)
     for _, i in kept:
         all_bright = np.clip(all_bright + (labels == i).astype(np.uint8), 0, 1)
+
+    #     The same low threshold also rescues a fragment so dim that almost
+    #     none of it passes Otsu (so it never became a candidate above): a
+    #     low-threshold region that is big enough, close and aligned to the
+    #     droplet, and not connected to it, is added too.
+    bg_level = float(np.median(blurred))
+    low_thresh = (bg_level + otsu_t) / 2.0
+    _, low_labels, low_stats, _ = cv2.connectedComponentsWithStats(
+        (blurred > low_thresh).astype(np.uint8), 8)
+    seed_low_ids = set(np.unique(low_labels[labels == kept[0][1]])) - {0}
+    kept_low_ids = set()
+    for _, i in kept[1:]:
+        kept_low_ids |= set(np.unique(low_labels[labels == i])) - {0}
+    min_low_area = max(min_component_area, min_area_ratio * seed_area)
+    for low_id in range(1, low_stats.shape[0]):
+        if low_id in seed_low_ids:
+            continue                      # would bridge into the main body
+        low_area = low_stats[low_id, cv2.CC_STAT_AREA]
+        if low_area > seed_area:
+            continue
+        if low_id not in kept_low_ids:
+            if low_area < min_low_area:
+                continue
+            lx, ly = low_stats[low_id, cv2.CC_STAT_LEFT], low_stats[low_id, cv2.CC_STAT_TOP]
+            low_bbox = (lx, ly, lx + low_stats[low_id, cv2.CC_STAT_WIDTH],
+                        ly + low_stats[low_id, cv2.CC_STAT_HEIGHT])
+            if not _close_and_aligned(chain_bbox, low_bbox, max_electrode_gap):
+                continue
+        all_bright = np.clip(
+            all_bright + (low_labels == low_id).astype(np.uint8), 0, 1)
+
+    # 5. Convex hull over all bright pixels from kept components.
+    #    Wrapping the combined point cloud in a convex hull fills the dark
+    #    electrode bands and any horizontal offset between halves in one step.
 
     pts = np.column_stack(np.where(all_bright))[:, ::-1].astype(np.int32)  # (x, y)
     hull = cv2.convexHull(pts)
