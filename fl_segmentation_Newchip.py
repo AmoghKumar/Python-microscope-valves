@@ -1676,13 +1676,13 @@ class MicroscopeControlGUI(QMainWindow):
         image_height = self.mmc.getImageHeight()
 
         rawImage = np.frombuffer(rawImage, dtype=np.uint16).reshape((image_height, image_width)).T
-        self.adjusted_image = exposure.rescale_intensity(rawImage)
-        raw_data_rescaled = self.adjusted_image.tobytes()
-        self.myQImage = QImage(raw_data_rescaled, image_width, image_height, QImage.Format_Grayscale16)
-        self.myQImage.save('C:\\Users\\Cell Culture Scope\\Pictures\\image_Qimage.png')
+        # No rescaling: display and save the camera counts exactly as read.
+        raw_data = rawImage.tobytes()
+        self.myQImage = QImage(raw_data, image_width, image_height, QImage.Format_Grayscale16)
+        tiff.imwrite('C:\\Users\\Cell Culture Scope\\Pictures\\image_raw.tiff', rawImage)
         self.image_Live.setPixmap(QPixmap.fromImage(self.myQImage).scaled(
             self.image_Live.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        return rawImage    # ← raw uint16, not self.adjusted_image
+        return rawImage
 
     def _quick_fl_snap(self):
         """Tab 1 Quick Fluorescence Snap: snap_EPI_image with the chosen
