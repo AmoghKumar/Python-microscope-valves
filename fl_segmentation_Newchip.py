@@ -599,6 +599,10 @@ FL_AREA_THRESHOLD = 0.80
 # back-to-back in that one cycle before the position switches to Maintain.
 FL_SYNTH_AREA_THRESHOLD = 0.40
 FL_SYNTH_FEED_COUNT     = 3
+# One-time purge (s) when the first position switches to Synthesis:
+# Synthesis inlet(s), then Maintain inlet, then buffer inlet.
+FL_SYNTH_PRIME_PURGE_S  = 5
+FL_BUFFER_PRIME_PURGE_S = 2
 
 
 def fl_area_threshold(mode) -> float:
@@ -802,9 +806,8 @@ class VideoThread(QThread):
             self._lock.unlock()
 
     def convert_raw_np(self, raw_img, img_width, img_height, pixel_Type):
-        # Raw counts: the viewer applies its own brightness/contrast window
-        # (recording rescales separately, from the image's own min/max).
-        return np.frombuffer(raw_img, dtype=pixel_Type).reshape((img_height, img_width)).T
+        rawImage = np.frombuffer(raw_img, dtype=pixel_Type).reshape((img_height, img_width)).T
+        return exposure.rescale_intensity(rawImage)
 
     def start_recording(self):
         # FIX: set flag under lock so the run loop sees a consistent state
@@ -1097,13 +1100,15 @@ class MicroscopeControlGUI(QMainWindow):
         self.selected_exposures = []
         self._experiment_stop_requested = False
         self._exp_worker = None
-        # Viewer brightness/contrast (display only - never touches saved data).
-        # _last_raw is the unmodified frame currently shown. While
-        # _bc_manual is False the view auto-stretches min..max per image;
-        # once a slider/Auto sets a window it stays at [_bc_min, _bc_max]
-        # (absolute camera counts) for later snaps and live frames.
-        # _bc_full is the count range the two sliders span.
+        # Viewer brightness/contrast (display only - never touches saved data,
+        # and never touches the live video, only snapped images).
+        # _last_raw is the unmodified last snapped frame. While _bc_manual is
+        # False the snap view auto-stretches min..max per image; once a
+        # slider/Auto sets a window it stays at [_bc_min, _bc_max] (absolute
+        # camera counts) for later snaps. _bc_full is the count range the two
+        # sliders span. _display_is_snap: viewer is showing a snap (vs live).
         self._last_raw   = None
+        self._display_is_snap = False
         self._bc_manual  = False
         self._bc_min     = 0.0
         self._bc_max     = 1.0
@@ -1745,26 +1750,26 @@ class MicroscopeControlGUI(QMainWindow):
         if self.bc_range_label.text() != text:
             self.bc_range_label.setText(text)
 
-    def _show_raw(self, raw, is_snap):
-        self._last_raw = raw
-        # Auto-follow mode tracks every frame's own range; a manual window
-        # only re-bases the sliders on snaps (live frames would make them jitter).
-        if not self._bc_manual or is_snap:
-            self._bc_full = (float(raw.min()), float(raw.max()))
-            if self._bc_manual:
-                self._bc_sync_sliders()
-        self._render_display(raw)
+    def _refresh_snap_display(self):
+        # Only ever redraws a snapped image - never replaces a live frame.
+        if self._display_is_snap and self._last_raw is not None:
+            self._render_display(self._last_raw)
 
     @pyqtSlot(np.ndarray)
     def _on_snap_image_ready(self, raw):
-        self._show_raw(raw, is_snap=True)
+        self._last_raw = raw
+        self._display_is_snap = True
+        self._bc_full = (float(raw.min()), float(raw.max()))
+        if self._bc_manual:
+            self._bc_sync_sliders()
+        self._render_display(raw)
 
     def _on_bc_slider_changed(self, _value=None):
         if self._bc_syncing or self._last_raw is None:
             return
         self._bc_manual = True
         self._bc_min, self._bc_max = self._bc_window_from_sliders()
-        self._render_display(self._last_raw)
+        self._refresh_snap_display()
 
     def auto_brightness_contrast(self):
         if self._last_raw is None:
@@ -1774,7 +1779,7 @@ class MicroscopeControlGUI(QMainWindow):
         self._bc_min, self._bc_max = self._imagej_auto_window(raw)
         self._bc_manual = True
         self._bc_sync_sliders()
-        self._render_display(raw)
+        self._refresh_snap_display()
 
     def reset_brightness_contrast(self):
         self._bc_manual = False
@@ -1786,7 +1791,7 @@ class MicroscopeControlGUI(QMainWindow):
             self._bc_syncing = False
         if self._last_raw is not None:
             self._bc_full = (float(self._last_raw.min()), float(self._last_raw.max()))
-            self._render_display(self._last_raw)
+            self._refresh_snap_display()
 
     def _quick_fl_snap(self):
         """Tab 1 Quick Fluorescence Snap: snap_EPI_image with the chosen
@@ -1801,9 +1806,11 @@ class MicroscopeControlGUI(QMainWindow):
                                  f"Quick fluorescence snap failed:\n\n{e}")
 
     def save_image(self):
-        # Saves the unmodified camera frame (16-bit PNG), never the
-        # brightness/contrast-adjusted view that's on screen.
-        if self._last_raw is None:
+        # A snapped image is saved as the unmodified camera frame (16-bit
+        # PNG), never the brightness/contrast-adjusted view. A live frame
+        # (not affected by those settings) is saved as displayed.
+        saving_snap = self._display_is_snap and self._last_raw is not None
+        if not saving_snap and not self.image_Live.pixmap():
             print("No image to save")
             return
 
@@ -1816,14 +1823,24 @@ class MicroscopeControlGUI(QMainWindow):
             self.directory_input.setText(folder)
 
         self.image_path = os.path.join(folder, "image.png")
-        Image.fromarray(np.ascontiguousarray(self._last_raw)).save(self.image_path)
+        if saving_snap:
+            Image.fromarray(np.ascontiguousarray(self._last_raw)).save(self.image_path)
+        else:
+            self.image_Live.pixmap().save(self.image_path)
         print(f"Image saved to {self.image_path}")
 
 
 
     @pyqtSlot(np.ndarray)
     def update_image(self, cv_img):
-        self._show_raw(cv_img, is_snap=False)
+        # Live video display: independent of the viewer's brightness/contrast
+        # (those apply to snapped images only).
+        self._display_is_snap = False
+        h, w = cv_img.shape
+        raw_data = cv_img.tobytes()
+        qimg = QImage(raw_data, w, h, QImage.Format_Grayscale16)
+        self.image_Live.setPixmap(QPixmap.fromImage(qimg).scaled(
+            self.image_Live.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def DIAlamp_ON(self):
         if self.dialamponlight.isChecked():
@@ -2523,6 +2540,26 @@ class MicroscopeControlGUI(QMainWindow):
         self.close_inlet(self.Buffer_inlet)
         self.control_valve(6,  state=True)
 
+    def _fl_prime_synthesis_inlets(self, mode_inlets):
+        """
+        One-time purge when the first position of the experiment switches to
+        Synthesis: Synthesis inlet(s) for FL_SYNTH_PRIME_PURGE_S, then the
+        Maintain inlet for the same time, then the buffer inlet for
+        FL_BUFFER_PRIME_PURGE_S - so both new reagents are at the inlets
+        before their first feeds.
+        """
+        for label, inlets, duration in (
+                (MODE_SYNTH,    mode_inlets[MODE_SYNTH],    FL_SYNTH_PRIME_PURGE_S),
+                (MODE_MAINTAIN, mode_inlets[MODE_MAINTAIN], FL_SYNTH_PRIME_PURGE_S),
+                ("Buffer",      [self.Buffer_inlet],        FL_BUFFER_PRIME_PURGE_S)):
+            if self._experiment_stop_requested:
+                raise ExperimentStopped()
+            self._fl_status(
+                f"First Synthesis switch – purging {label} inlet(s) "
+                f"{'+'.join(map(str, inlets))} for {duration:g} s")
+            pw = DropletWorker("purge", inlets=list(inlets), purge_duration=duration)
+            pw.start(); pw.wait()
+
     def _start_fl_experiment(self, interval_min: int, total_min: int):
         """
         GUI-thread entry point for the FL-segmentation timelapse: does the
@@ -2691,6 +2728,8 @@ class MicroscopeControlGUI(QMainWindow):
         # positions are imaged and logged but never fed.
         pos_mode       = {idx: MODE_UPCONC for idx in addressed}
         self._fl_report_modes(pos_mode)
+        # The one-time inlet purge on the first switch to Synthesis
+        synth_inlets_primed = False
 
         os.makedirs(base, exist_ok=True)
         fluo_csv = os.path.join(base, "fluorescence_upconcentration.csv")
@@ -2845,6 +2884,12 @@ class MicroscopeControlGUI(QMainWindow):
                         )
                         tiff.imwrite(os.path.join(fl_dir, extra_fname), raw_extra)
                         time.sleep(0.2)
+
+            # ── first Synthesis switch of the experiment: prime inlets once ──
+            if (not synth_inlets_primed
+                    and any(m != MODE_UPCONC for m in pos_mode.values())):
+                self._fl_prime_synthesis_inlets(mode_inlets)
+                synth_inlets_primed = True
 
             # ── no triggers this tick ─────────────────────────────────────────────
             if not triggered_positions:
