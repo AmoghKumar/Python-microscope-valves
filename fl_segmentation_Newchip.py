@@ -1112,7 +1112,7 @@ class DropletWorker(QThread):
                  inlets=None,
                  purge_duration=0, flow_duration=0, drive_duration=0,
                  chemostat_number=4, PWM_duration1=0.05, PWM_duration2=0.05,
-                 PWM_totalduration=5):
+                 PWM_totalduration=5, connection_duration=2):
         super().__init__()
         self.Numato_port       = Numato_device
         self.operation         = operation
@@ -1126,6 +1126,7 @@ class DropletWorker(QThread):
         self.PWM_duration1     = PWM_duration1
         self.PWM_duration2     = PWM_duration2
         self.PWM_totalduration = PWM_totalduration
+        self.Connection_duration = connection_duration
 
     def run(self):
         ops = {
@@ -1134,7 +1135,9 @@ class DropletWorker(QThread):
             "drive":      lambda: self.drive_droplet(self.chemostat),
             "characterize": lambda: self.characterize_droplet(*self.inlets, self.chemostat),
             "wash":       lambda: self.wash_step(self.input_1, self.input_2),
-        
+            "connect":    lambda: self.connect_chemostats(self.input_1, self.input_2,
+                                                          self.Connection_duration),
+
         }
 
         ops.get(self.operation, lambda: print("Invalid operation"))()
@@ -1171,6 +1174,21 @@ class DropletWorker(QThread):
         self.control_valve(11, state=True)'''
         self.generate_droplet(inlet_1, inlet_2)
         self.drive_droplet(chemostat_number)
+        send_to_arduino(3)
+
+    def connect_chemostats(self, chemostat_1, chemostat_2, connection_duration):
+        """
+        Open the valves of two chemostats (1-8) together for
+        connection_duration seconds so their contents can exchange.
+        """
+        send_to_arduino(2)
+        send_to_arduino(4)
+        self.control_valve(11 + chemostat_1, True)
+        self.control_valve(11 + chemostat_2, True)
+        time.sleep(connection_duration)
+        self.control_valve(11 + chemostat_1, False)
+        time.sleep(1)
+        self.control_valve(11 + chemostat_2, False)
         send_to_arduino(3)
 
     def _inlet_to_valves(self, inlet: int) -> tuple:
@@ -1476,7 +1494,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.mmc.setProperty(self.camera, 'CONVERSION FACTOR COEFF', 0.5)
         self.mmc.setProperty(self.camera, 'PixelType', '16bit')
         self.mmc.setProperty(self.DIAlamp, 'ComputerControl', 'On')
-        self.mmc.setProperty(self.DIAlamp, 'Intensity', 3)
+        self.mmc.setProperty(self.DIAlamp, 'Intensity', 4)
         self.mmc.setProperty(self.DIAlamp, 'State', 0)
         self.mmc.setProperty(self.DIAshutter, 'State', 0)
         self.mmc.setProperty(self.EPIshutter,  'State', 0)
@@ -1756,6 +1774,29 @@ class MicroscopeControlGUI(QMainWindow):
         volt_layout.addLayout(volt_row)
         volt_layout.addWidget(self.TurnOnVolts)
         right.addWidget(group("Voltage", volt_layout))
+
+        # -- Connect two chemostats for a set duration
+        self.chemostat1_Input          = QLineEdit("1")
+        self.chemostat2_Input           = QLineEdit("2")
+        self.connection_duration_Input  = QLineEdit("2")
+        self.Connect_chemostats_button  = QPushButton("Connect chemostats")
+        self.Connect_chemostats_button.setStyleSheet(BTN_GREEN)
+        self.Connect_chemostats_button.clicked.connect(self.Connect_Chemostats)
+
+        connect_row = QHBoxLayout()
+        connect_row.setSpacing(8)
+        for lbl, widget in [
+            ("Chemostat #1:",             self.chemostat1_Input),
+            ("Chemostat #2:",             self.chemostat2_Input),
+            ("Connection duration (s):",  self.connection_duration_Input),
+        ]:
+            l = QLabel(lbl); l.setStyleSheet("color:#aaa;")
+            box = QHBoxLayout()
+            box.addWidget(l)
+            box.addWidget(widget)
+            connect_row.addLayout(box, 1)
+        connect_row.addWidget(self.Connect_chemostats_button, 1)
+        right.addWidget(group("Connect Chemostats", connect_row))
 
         # -- Buffer inlet selector
         buf_layout = QHBoxLayout()
@@ -2073,13 +2114,13 @@ class MicroscopeControlGUI(QMainWindow):
         image_height = self.mmc.getImageHeight()
 
         rawImage = np.frombuffer(rawImage, dtype=np.uint16).reshape((image_height, image_width)).T
-        self.adjusted_image = exposure.rescale_intensity(rawImage)
-        raw_data_rescaled = self.adjusted_image.tobytes()
-        self.myQImage = QImage(raw_data_rescaled, image_width, image_height, QImage.Format_Grayscale16)
-        self.myQImage.save('C:\\Users\\Cell Culture Scope\\Pictures\\image_Qimage.png')
+        # No rescaling: display and save the camera counts exactly as read.
+        raw_data = rawImage.tobytes()
+        self.myQImage = QImage(raw_data, image_width, image_height, QImage.Format_Grayscale16)
+        tiff.imwrite('C:\\Users\\Cell Culture Scope\\Pictures\\image_raw.tiff', rawImage)
         self.image_Live.setPixmap(QPixmap.fromImage(self.myQImage).scaled(
             self.image_Live.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        return rawImage    # ← raw uint16, not self.adjusted_image
+        return rawImage
 
     def save_image(self):
         if not self.image_Live.pixmap():
@@ -2315,6 +2356,26 @@ class MicroscopeControlGUI(QMainWindow):
             drive_duration   = float(self.drive_duration_Input.text()),
             chemostat_number = int(self.inlet_Input.text()))
         self.Characterize_Droplet_thread.start()
+
+    def Connect_Chemostats(self):
+        try:
+            chemostat_1 = int(self.chemostat1_Input.text())
+            chemostat_2 = int(self.chemostat2_Input.text())
+            duration    = float(self.connection_duration_Input.text())
+        except ValueError:
+            QMessageBox.warning(self, 'Invalid input',
+                                'Chemostats must be integers 1-8 and duration a number.')
+            return
+        if not (1 <= chemostat_1 <= 8 and 1 <= chemostat_2 <= 8):
+            QMessageBox.warning(self, 'Invalid input', 'Chemostat numbers must be 1-8.')
+            return
+        if duration < 0:
+            QMessageBox.warning(self, 'Invalid input', 'Connection duration must be ≥ 0.')
+            return
+        self.Connect_Chemostats_thread = DropletWorker(
+            "connect", chemostat_1, chemostat_2,
+            connection_duration=duration)
+        self.Connect_Chemostats_thread.start()
 
     def PWM_droplet(self, input_1=12, input_2=13):
         self.PWM_thread = DropletWorker(
