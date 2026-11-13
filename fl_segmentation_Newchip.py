@@ -969,9 +969,11 @@ class DropletWorker(QThread):
         self.control_valve(b, state=True)
 
     def shrink_droplet(self, Chemostat_number):
+        self.control_valve(11, state=False)
         self.control_valve(Chemostat_number + 11, state=True)
         time.sleep(self.Shrink_duration)
         self.control_valve(Chemostat_number + 11, state=False)
+        self.control_valve(11, state=True)
 
     def purge_inlet(self, *inlets: int):
         """
