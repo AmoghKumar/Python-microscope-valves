@@ -3502,6 +3502,16 @@ class MicroscopeControlGUI(QMainWindow):
             # whichever filter/exposure that happens to be.
             seg_filt, seg_exp = selected_exposures[0]
 
+            # A Feed/Exchange in the previous tick ran the DIA lamp + live
+            # video (auto-shutter on the DIA shutter), leaving the shutters in
+            # an uncertain state; the first EPI snap's waitForSystem() then
+            # stalls on TIEpiShutter. Reset both shutters first, as Phase 2
+            # and the Exchange shrink already do.
+            self.mmc.setProperty(self.EPIshutter, 'State', 0)
+            self.mmc.setProperty(self.DIAshutter, 'State', 0)
+            self.mmc.waitForSystem()
+            time.sleep(1.0)
+
             for idx, (px, py, pz) in enumerate(positions):
                 if self._experiment_stop_requested:
                     raise ExperimentStopped()
@@ -3613,8 +3623,9 @@ class MicroscopeControlGUI(QMainWindow):
             names = [f"Pos {i + 1}" for i in triggered_positions]
             print(f"\n  ⚠ Triggered: {', '.join(names)}")
 
-            # ── Phase 2: remaining rows of exposure table → all positions ─────────
-            # Only runs when at least one position was triggered this tick.
+            # ── Phase 2: remaining rows of exposure table → triggered positions ───
+            # Only runs when at least one position was triggered this tick,
+            # and only images the positions that triggered.
             # Row 0 was already imaged in Phase 1, so we start from row 1.
             if len(selected_exposures) > 1:
                 # Reset shutter state after chemostat protocol before imaging.
@@ -3625,10 +3636,11 @@ class MicroscopeControlGUI(QMainWindow):
                 self.mmc.setProperty(self.DIAshutter, 'State', 0)
                 self.mmc.waitForSystem()
                 time.sleep(1.0)
-                self._fl_status("Full exposure table imaging of all positions …")
-                for idx, (px, py, pz) in enumerate(positions):
+                self._fl_status("Full exposure table imaging of triggered positions …")
+                for idx in triggered_positions:
                     if self._experiment_stop_requested:
                         raise ExperimentStopped()
+                    px, py, pz = positions[idx]
                     pos_num  = idx + 1
                     pos_loop = pos_loop_count.get(idx, 0) + 1
 
