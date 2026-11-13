@@ -3372,11 +3372,12 @@ class MicroscopeControlGUI(QMainWindow):
              all filter images are saved as raw uint16 TIFFs.
           2. segment_droplet_fl() segments the droplet and measures its area.
              The segmentation overlay is saved alongside the TIFF for inspection.
-          3. Initial area is recorded on the very first tick.
+          3. Initial area is set on the very first tick: the position's Fix
+             Droplet Sizes final area if there is one, else the tick-1 area.
           4. Droplet fluorescence (median inside mask − median outside) is
              recorded as Fluo_Pos#_initial on tick 1 and Fluo_Pos#_##min
              afterwards, logged to <base>/fluorescence.csv.
-          5. From tick 2 onwards, if an addressed position's
+          5. Every tick, including tick 1, if an addressed position's
              area < AREA_THRESHOLD × initial, it gets one droplet generated
              from the Feed inlets (mode_inlets; a pair is opened together)
              and its loop counter increments. Every addressed position
@@ -3577,27 +3578,32 @@ class MicroscopeControlGUI(QMainWindow):
                         base_mask = os.path.join(fl_dir, overlay_fname)
                         print(f"  Pos {pos_num}: initial area recorded = {seg_area} px")
                     initial_areas[idx] = base_area
+                    initial = base_area
                     # A position with no droplet found is left out of the
                     # auto-shrink baseline, so auto shrink measures a fresh
                     # one for it instead.
                     if base_area > 0:
                         shrink_initial_areas[pos_num] = base_area
                         shrink_baseline_masks[pos_num] = base_mask
-                else:
-                    ratio = seg_area / initial if initial > 0 else 1.0
-                    print(
-                        f"  Pos {pos_num}  Loop {pos_loop}: "
-                        f"area = {seg_area} px  ({ratio * 100:.1f}% of initial  "
-                        f"[threshold {FL_AREA_THRESHOLD * 100:.0f}%])"
+
+                # Area trigger - every tick, including tick 1 (a position
+                # whose tick-1 area is already below the threshold x its Fix
+                # Droplet Sizes area is fed straight away; one without a Fix
+                # area has ratio 1.0 on tick 1 and can't trigger).
+                ratio = seg_area / initial if initial > 0 else 1.0
+                print(
+                    f"  Pos {pos_num}  Loop {pos_loop}: "
+                    f"area = {seg_area} px  ({ratio * 100:.1f}% of initial  "
+                    f"[threshold {FL_AREA_THRESHOLD * 100:.0f}%])"
+                )
+                if (idx in feeds_done and initial > 0
+                        and seg_area < FL_AREA_THRESHOLD * initial):
+                    triggered_positions.append(idx)
+                    self._fl_status(
+                        f"⚠ Pos {pos_num} TRIGGERED "
+                        f"({ratio * 100:.1f}% < "
+                        f"{FL_AREA_THRESHOLD * 100:.0f}%)"
                     )
-                    if (idx in feeds_done and initial > 0
-                            and seg_area < FL_AREA_THRESHOLD * initial):
-                        triggered_positions.append(idx)
-                        self._fl_status(
-                            f"⚠ Pos {pos_num} TRIGGERED "
-                            f"({ratio * 100:.1f}% < "
-                            f"{FL_AREA_THRESHOLD * 100:.0f}%)"
-                        )
 
             # ── tick 1: verify the baseline masks up front ────────────────────
             # The tick-1 masks are the Exchange auto-shrink baseline; confirm
