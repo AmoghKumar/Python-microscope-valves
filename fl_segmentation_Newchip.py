@@ -847,11 +847,17 @@ class VideoThread(QThread):
 #  Droplet worker thread
 # ─────────────────────────────────────────────
 class DropletWorker(QThread):
+    # Buffer inlet (1-9) chosen in tab 1's "Buffer Inlet" spinbox; the GUI
+    # keeps this in sync. generate_chemostat (Initialize Chemostats) flows
+    # from this inlet. generate_droplet still uses the inlets it is given.
+    buffer_inlet = 9
+
     def __init__(self, operation, input_1=None, input_2=None,
                  inlets=None,
                  purge_duration=0, flow_duration=0, drive_duration=0,
+                 shrink_duration=0,
                  chemostat_number=4, PWM_duration1=0.05, PWM_duration2=0.05,
-                 PWM_totalduration=5):
+                 PWM_totalduration=5, chemostats=None, stop_check=None):
         super().__init__()
         self.Numato_port       = Numato_device
         self.operation         = operation
@@ -862,18 +868,23 @@ class DropletWorker(QThread):
         self.Purge_duration    = purge_duration
         self.Flow_duration     = flow_duration
         self.Drive_duration    = drive_duration
+        self.Shrink_duration   = shrink_duration
         self.PWM_duration1     = PWM_duration1
         self.PWM_duration2     = PWM_duration2
         self.PWM_totalduration = PWM_totalduration
+        self.chemostats        = list(chemostats) if chemostats is not None else []
+        self.stop_check        = stop_check   # optional callable -> True to halt early
 
     def run(self):
         ops = {
             "purge":        lambda: self.purge_inlet(*self.inlets),
             "generate": lambda: self.generate_droplet(*self.inlets),
             "drive":      lambda: self.drive_droplet(self.chemostat),
+            "shrink":     lambda: self.shrink_droplet(self.chemostat),
             "characterize": lambda: self.characterize_droplet(*self.inlets, self.chemostat),
             "wash":       lambda: self.wash_step(self.input_1, self.input_2),
-        
+            "initialize": lambda: self.initialize_chemostats(*self.inlets, self.chemostats),
+
         }
 
         ops.get(self.operation, lambda: print("Invalid operation"))()
@@ -911,6 +922,28 @@ class DropletWorker(QThread):
         self.generate_droplet(inlet_1, inlet_2)
         self.drive_droplet(chemostat_number)
         send_to_arduino(3)
+
+    def initialize_chemostats(self, inlet_1, inlet_2, chemostats):
+        """
+        Fill the given chemostats with droplets: for each chemostat, one at
+        a time, run the whole replenishment scheme (purge, generate, drive -
+        the same sequence as the Generate Droplet button) twice in a row,
+        using this worker's purge/flow/drive durations. stop_check, if
+        given, is polled before each pass so a Stop request halts it
+        between passes (never mid valve sequence).
+        """
+        for chem in chemostats:
+            for rep in (1, 2):
+                if self.stop_check is not None and self.stop_check():
+                    print("Initialize chemostats: stop requested - halting.")
+                    return
+                print(f"Initializing chemostat {chem}: replenishment pass {rep}/2")
+                self.purge_inlet(inlet_1, inlet_2)        
+                send_to_arduino(5)
+                send_to_arduino(2)
+                self.generate_chemostat(chem)
+                self.drive_droplet(chem)
+                send_to_arduino(3)
 
     def _inlet_to_valves(self, inlet: int) -> tuple:
         """
@@ -1024,6 +1057,35 @@ class DropletWorker(QThread):
         time.sleep(0.2)
 
 
+    def generate_chemostat(self, chem_number):
+        """
+        Generate a chemostat from one or more inlets.
+        Opens the valve pairs for each requested inlet plus the hardcoded
+        downstream flow valves (8, 9), flows for Flow_duration, then closes.
+        """
+        inlets = (self.buffer_inlet,)
+
+        valves_to_open = set()
+        for inlet in inlets:
+            a, b = self._inlet_to_valves(inlet)
+            valves_to_open.add(a)
+            valves_to_open.add(b)
+
+        
+        for v in valves_to_open:
+            self.control_valve(v, state=False)
+        print("generated valves", valves_to_open)
+        send_to_arduino(5)
+        self.control_valve(11, state=False)
+        self.control_valve(chem_number + 11, state=True)
+        self.control_valve(8,  state=False)   # hardcoded downstream flow valve
+        time.sleep(self.Flow_duration)
+        self.control_valve(8,  state=True)
+        
+        for v in valves_to_open:
+            self.control_valve(v, state=True)
+
+
     def drive_droplet(self, Chemostat_number):
         self.control_valve(7, state=False)
         self.control_valve(10, state=False)
@@ -1100,6 +1162,15 @@ class MicroscopeControlGUI(QMainWindow):
         self.selected_exposures = []
         self._experiment_stop_requested = False
         self._exp_worker = None
+        # Final droplet areas {chemostat N: px} from the last Fix Droplet
+        # Sizes run; the FL experiment uses them as its initial areas.
+        self._fix_final_areas = {}
+        # Initial fluorescence {chemostat N: (fluo, med_in, med_out, filt, exp)}
+        # from the same final Fix Droplet Sizes images as _fix_final_areas.
+        self._fix_final_fluo = {}
+        # Last measurement per chemostat from _measure_chemostat_droplet_area:
+        # {chemostat N: (raw_fl, mask, filt, exp)}
+        self._last_chem_measurement = {}
         # Viewer brightness/contrast (display only - never touches saved data,
         # and never touches the live video, only snapped images).
         # _last_raw is the unmodified last snapped frame. While _bc_manual is
@@ -1498,9 +1569,10 @@ class MicroscopeControlGUI(QMainWindow):
         # -- Droplet parameters
         dp_grid = QGridLayout()
         dp_grid.setSpacing(4)
-        self.purge_duration_Input  = QLineEdit("0")
-        self.flow_duration_Input   = QLineEdit("0")
-        self.drive_duration_Input  = QLineEdit("0")
+        self.Shrink_duration_Input = QLineEdit("5")
+        self.purge_duration_Input  = QLineEdit("1")
+        self.flow_duration_Input   = QLineEdit("0.1")
+        self.drive_duration_Input  = QLineEdit("5")
         self.inlet_Input           = QLineEdit("1")
         self.inlet1_Input          = QSpinBox()
         self.inlet1_Input.setRange(1, 9)
@@ -1509,6 +1581,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.inlet2_Input.setRange(1, 9)
         self.inlet2_Input.setValue(2)
         for row, (lbl, widget) in enumerate([
+            ("Shrink duration (s):",       self.Shrink_duration_Input),
             ("Purge duration (s):",       self.purge_duration_Input),
             ("Aqueous flow duration (s):", self.flow_duration_Input),
             ("Drive duration (s):",        self.drive_duration_Input),
@@ -1538,8 +1611,61 @@ class MicroscopeControlGUI(QMainWindow):
         inlet_row.addLayout(inlet1_box, 1)
         inlet_row.addLayout(inlet2_box, 1)
         inlet_row.addWidget(self.Generate_drop_button, 1)
-        dp_grid.addLayout(inlet_row, 4, 0, 1, 2)
+        dp_grid.addLayout(inlet_row, 5, 0, 1, 2)
         right.addWidget(group("Droplet Parameters", dp_grid))
+
+        # -- Initialize chemostats: fills the ticked chemostats with droplets
+        #    (purge/generate/drive x2 each, durations from Droplet
+        #    Parameters above), then shrinks them to the desired area.
+        init_layout = QVBoxLayout()
+        init_layout.setSpacing(4)
+        self.init_inlet1_Input = QSpinBox()
+        self.init_inlet1_Input.setRange(1, 9)
+        self.init_inlet1_Input.setValue(1)
+        self.init_inlet2_Input = QSpinBox()
+        self.init_inlet2_Input.setRange(1, 9)
+        self.init_inlet2_Input.setValue(2)
+        init_inlet_row = QHBoxLayout()
+        init_inlet_row.setSpacing(8)
+        for text, spin in (("Inlet 1 (1-9):", self.init_inlet1_Input),
+                           ("Inlet 2 (1-9):", self.init_inlet2_Input)):
+            lbl = QLabel(text); lbl.setStyleSheet("color:#aaa;")
+            init_inlet_row.addWidget(lbl)
+            init_inlet_row.addWidget(spin, 1)
+        init_layout.addLayout(init_inlet_row)
+
+        init_chem_row = QHBoxLayout()
+        init_chem_row.setSpacing(6)
+        chem_lbl = QLabel("Chemostats:"); chem_lbl.setStyleSheet("color:#aaa;")
+        init_chem_row.addWidget(chem_lbl)
+        self.init_chem_checks = []
+        for i in range(8):
+            cb = QCheckBox(str(i + 1))
+            self.init_chem_checks.append(cb)
+            init_chem_row.addWidget(cb)
+        init_chem_row.addStretch()
+        init_layout.addLayout(init_chem_row)
+
+        self.init_desired_area_Input = QLineEdit("52000")
+        area_lbl = QLabel("Desired droplet area (px):"); area_lbl.setStyleSheet("color:#aaa;")
+        self.initialize_chemostats_button = QPushButton("Initialize Chemostats")
+        self.initialize_chemostats_button.setStyleSheet(BTN_GREEN)
+        self.initialize_chemostats_button.clicked.connect(self.Initialize_Chemostats)
+        init_area_row = QHBoxLayout()
+        init_area_row.setSpacing(8)
+        init_area_row.addWidget(area_lbl)
+        init_area_row.addWidget(self.init_desired_area_Input, 1)
+        init_layout.addLayout(init_area_row)
+
+        self.fix_droplet_sizes_button = QPushButton("Fix Droplet Sizes")
+        self.fix_droplet_sizes_button.setStyleSheet(BTN_GREEN)
+        self.fix_droplet_sizes_button.clicked.connect(self.Fix_Droplet_Sizes)
+        init_btn_row = QHBoxLayout()
+        init_btn_row.setSpacing(8)
+        init_btn_row.addWidget(self.initialize_chemostats_button, 1)
+        init_btn_row.addWidget(self.fix_droplet_sizes_button, 1)
+        init_layout.addLayout(init_btn_row)
+        right.addWidget(group("Initialize Chemostats", init_layout))
 
         # -- Voltage
         volt_layout = QVBoxLayout(); volt_layout.setSpacing(6)
@@ -1565,8 +1691,10 @@ class MicroscopeControlGUI(QMainWindow):
         self.buffer_inlet_Input.setRange(1, 9)
         self.buffer_inlet_Input.setValue(9)
         self.buffer_inlet_Input.valueChanged.connect(
-            lambda v: setattr(self, "Buffer_inlet", v)
+            lambda v: (setattr(self, "Buffer_inlet", v),
+                       setattr(DropletWorker, "buffer_inlet", v))
         )
+        DropletWorker.buffer_inlet = self.buffer_inlet_Input.value()
         buf_layout.addWidget(buf_lbl)
         buf_layout.addWidget(self.buffer_inlet_Input)
         right.addWidget(group("Buffer Inlet", buf_layout))
@@ -2050,6 +2178,302 @@ class MicroscopeControlGUI(QMainWindow):
             chemostat_number = int(self.inlet_Input.text()))
         self.Characterize_Droplet_thread.start()
 
+    def Initialize_Chemostats(self):
+        """
+        Initialize Chemostats button (GUI thread): validate and snapshot every
+        input, then run the whole initialization on a background
+        ExperimentWorker so the GUI stays responsive and the Stop button works.
+        Chemostat N is saved stage position N.
+        """
+        chemostats = [i + 1 for i, cb in enumerate(self.init_chem_checks) if cb.isChecked()]
+        if not chemostats:
+            QMessageBox.warning(self, "Initialize chemostats",
+                                "Tick at least one chemostat to initialize.")
+            return
+        try:
+            desired_area    = float(self.init_desired_area_Input.text())
+            purge_duration  = float(self.purge_duration_Input.text())
+            flow_duration   = float(self.flow_duration_Input.text())
+            drive_duration  = float(self.drive_duration_Input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Initialize chemostats",
+                                "Desired area and the purge / flow / drive "
+                                "durations must all be numbers.")
+            return
+        if desired_area <= 0:
+            QMessageBox.warning(self, "Initialize chemostats",
+                                "Desired droplet area must be greater than 0.")
+            return
+        positions_table = [list(p) for p in self.positions]
+        missing = [c for c in chemostats if c > len(positions_table)]
+        if missing:
+            QMessageBox.warning(
+                self, "Initialize chemostats",
+                f"No saved stage position for chemostat(s) {missing} - chemostat N "
+                f"uses saved position N, and only {len(positions_table)} position(s) "
+                f"are saved.")
+            return
+        if not self.selected_exposures:
+            QMessageBox.warning(
+                self, "Initialize chemostats",
+                "Droplet area is measured with the first row of the exposure table - "
+                "set a filter/exposure and click Save Values first.")
+            return
+        self._launch_experiment_worker(
+            self._initialize_chemostats_run,
+            chemostats=chemostats,
+            inlet_1=self.init_inlet1_Input.value(),
+            inlet_2=self.init_inlet2_Input.value(),
+            desired_area=desired_area,
+            positions_table=positions_table,
+            selected_exposures=[list(e) for e in self.selected_exposures],
+            purge_duration=purge_duration,
+            flow_duration=flow_duration,
+            drive_duration=drive_duration,
+        )
+
+    def Fix_Droplet_Sizes(self):
+        """
+        Fix Droplet Sizes button (GUI thread): validate and snapshot the
+        inputs, then image + shrink the ticked chemostats on a background
+        ExperimentWorker. Chemostat N is saved stage position N.
+        """
+        chemostats = [i + 1 for i, cb in enumerate(self.init_chem_checks) if cb.isChecked()]
+        if not chemostats:
+            QMessageBox.warning(self, "Fix droplet sizes",
+                                "Tick at least one chemostat to fix.")
+            return
+        try:
+            desired_area    = float(self.init_desired_area_Input.text())
+            shrink_duration = float(self.Shrink_duration_Input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Fix droplet sizes",
+                                "Desired area and the shrink duration must be numbers.")
+            return
+        if desired_area <= 0:
+            QMessageBox.warning(self, "Fix droplet sizes",
+                                "Desired droplet area must be greater than 0.")
+            return
+        positions_table = [list(p) for p in self.positions]
+        missing = [c for c in chemostats if c > len(positions_table)]
+        if missing:
+            QMessageBox.warning(
+                self, "Fix droplet sizes",
+                f"No saved stage position for chemostat(s) {missing} - chemostat N "
+                f"uses saved position N, and only {len(positions_table)} position(s) "
+                f"are saved.")
+            return
+        if not self.selected_exposures:
+            QMessageBox.warning(
+                self, "Fix droplet sizes",
+                "Droplet area is measured with the first row of the exposure table - "
+                "set a filter/exposure and click Save Values first.")
+            return
+        self._launch_experiment_worker(
+            self._fix_droplet_sizes_run,
+            chemostats=chemostats,
+            desired_area=desired_area,
+            positions_table=positions_table,
+            selected_exposures=[list(e) for e in self.selected_exposures],
+            shrink_duration=shrink_duration,
+        )
+
+    def _fix_droplet_sizes_run(self, **kwargs):
+        try:
+            areas = self._fix_droplet_sizes_body(**kwargs)
+            # Becomes the next FL experiment's initial areas.
+            self._fix_final_areas = dict(areas)
+            # Initial fluorescence from the same final images (the last
+            # measurement of each chemostat is the one its final area came from).
+            self._fix_final_fluo = {}
+            for chem_num in sorted(areas):
+                raw_fl, mask, filt, exp = self._last_chem_measurement[chem_num]
+                result = droplet_fluorescence(raw_fl, mask)
+                if result is None:
+                    print(f"  Chemostat {chem_num}: no droplet mask - initial "
+                          f"fluorescence will be measured on the first cycle instead.")
+                    continue
+                self._fix_final_fluo[chem_num] = (*result, filt, exp)
+                print(f"  Chemostat {chem_num}: initial fluorescence = {result[0]:.1f} "
+                      f"(in {result[1]:.1f} - out {result[2]:.1f})")
+            print("These final areas and fluorescence values will be used as the "
+                  "initial values of the next FL experiment.")
+        except Exception:
+            self._safe_shutdown_valves()
+            raise
+
+    def _initialize_chemostats_run(self, **kwargs):
+        try:
+            self._initialize_chemostats_body(**kwargs)
+        except Exception:
+            # Stop or a real failure: reset to a known-safe state before
+            # propagating (same pattern as TimeLapse_Experiment).
+            self._safe_shutdown_valves()
+            raise
+
+    @staticmethod
+    def _init_area_line(pos_num, area, desired_area, tol):
+        pct = 100.0 * area / desired_area
+        if area > desired_area * (1 + tol):
+            verdict = f"TOO LARGE (> +{tol*100:.0f}%)"
+        elif area < desired_area * (1 - tol):
+            verdict = f"TOO SMALL (< -{tol*100:.0f}%)"
+        else:
+            verdict = f"within +/-{tol*100:.0f}%"
+        return (f"  Position {pos_num}: {area} px = {pct:.1f}% of desired "
+                f"({area - desired_area:+.0f} px) - {verdict}")
+
+    def _initialize_chemostats_body(self, chemostats, inlet_1, inlet_2, desired_area,
+                                    positions_table, selected_exposures,
+                                    purge_duration, flow_duration, drive_duration):
+        """
+        1. Fill: for each ticked chemostat, run purge/generate/drive twice
+           (DropletWorker "initialize").
+        2. Measure + report: droplet area at EVERY saved position vs the
+           desired area, in the log.
+        No shrinking here - use "Fix Droplet Sizes" for that.
+        Measurement reuses _measure_chemostat_droplet_area (first row of the
+        exposure table + segment_droplet_fl), and saves
+        Mask_/Raw_chemostat#_init_before files.
+        """
+        TOL = 0.05
+        lo, hi = desired_area * (1 - TOL), desired_area * (1 + TOL)
+        chemostats = sorted(chemostats)
+
+        print(f"=== Initialize chemostats {chemostats}: desired area "
+              f"{desired_area:.0f} px (+/-{TOL*100:.0f}% = {lo:.0f}-{hi:.0f} px) ===")
+
+        # 1. fill
+        worker = DropletWorker(
+            "initialize", inlets=[inlet_1, inlet_2], chemostats=chemostats,
+            purge_duration=purge_duration, flow_duration=flow_duration,
+            drive_duration=drive_duration,
+            stop_check=lambda: self._experiment_stop_requested)
+        worker.start(); worker.wait()
+        if self._experiment_stop_requested:
+            raise ExperimentStopped()
+
+        # 2. measure + report every saved position
+        filt, exp = selected_exposures[0]
+        print("Measuring droplet area at every saved position:")
+        for pos_num in range(1, len(positions_table) + 1):
+            if self._experiment_stop_requested:
+                raise ExperimentStopped()
+            area = self._measure_chemostat_droplet_area(
+                pos_num, positions_table, filt, exp, save_tag="init_before")
+            print(self._init_area_line(pos_num, area, desired_area, TOL))
+
+    def _fix_droplet_sizes_body(self, chemostats, desired_area, positions_table,
+                                selected_exposures, shrink_duration):
+        """
+        1. Image: measure the droplet area at each ticked chemostat's
+           position and report it against the desired area.
+        2. Shrink: for each ticked chemostat that is too large, one at a
+           time (highest number first), shrink and re-measure until its area
+           is within +/-5% of the desired area. Ones already in range are
+           left alone; ones too small can't be grown back.
+        Saves Mask_/Raw_chemostat#_fix_before and ..._fix_round# files.
+        """
+        TOL = 0.05
+        MAX_ROUNDS = 8
+        MIN_SHRINK_DURATION = 0.5
+        MAX_SHRINK_DURATION = 1.5 * shrink_duration
+        lo, hi = desired_area * (1 - TOL), desired_area * (1 + TOL)
+        chemostats = sorted(chemostats)
+
+        print(f"=== Fix droplet sizes {chemostats}: desired area "
+              f"{desired_area:.0f} px (+/-{TOL*100:.0f}% = {lo:.0f}-{hi:.0f} px) ===")
+
+        # 1. image the ticked chemostats
+        filt, exp = selected_exposures[0]
+        areas = {}
+        print("Measuring droplet area at each selected chemostat:")
+        for chem_num in chemostats:
+            if self._experiment_stop_requested:
+                raise ExperimentStopped()
+            areas[chem_num] = self._measure_chemostat_droplet_area(
+                chem_num, positions_table, filt, exp, save_tag="fix_before")
+            print(self._init_area_line(chem_num, areas[chem_num], desired_area, TOL))
+
+        # 2. shrink each too-large chemostat until within tolerance
+        for chem_num in sorted(chemostats, reverse=True):
+            area = areas[chem_num]
+            if lo <= area <= hi:
+                print(f"  Chemostat {chem_num}: already within range - no shrinking needed.")
+                continue
+            if area < lo:
+                print(f"  Chemostat {chem_num}: already below the range - shrinking "
+                      f"can't make it bigger, leaving it as is.")
+                continue
+
+            print(f"  Chemostat {chem_num}: shrinking from {area} px toward {desired_area:.0f} px")
+            dur = min(MAX_SHRINK_DURATION, max(MIN_SHRINK_DURATION, shrink_duration))
+            prev_area = area
+            for round_num in range(1, MAX_ROUNDS + 1):
+                if self._experiment_stop_requested:
+                    raise ExperimentStopped()
+                print(f"  Chemostat {chem_num}: shrinking for {dur:.2f}s (round {round_num})")
+                sw = DropletWorker("shrink", chemostat_number=chem_num, shrink_duration=dur)
+                sw.start(); sw.wait()
+                area = self._measure_chemostat_droplet_area(
+                    chem_num, positions_table, filt, exp, save_tag=f"fix_round{round_num}")
+                areas[chem_num] = area
+                print(self._init_area_line(chem_num, area, desired_area, TOL))
+                if lo <= area <= hi:
+                    print(f"  Chemostat {chem_num}: reached range after {round_num} round(s).")
+                    break
+                if area < lo:
+                    print(f"  WARNING: chemostat {chem_num} overshot below the range - "
+                          f"can't grow it back, stopping its shrinking.")
+                    break
+                drop = prev_area - area
+                if drop > 1e-6:
+                    next_dur = (area - desired_area) / (drop / dur)   # aim for the centre of the range
+                else:
+                    next_dur = dur * 1.5   # no measurable progress - try longer
+                dur = min(MAX_SHRINK_DURATION, max(MIN_SHRINK_DURATION, next_dur))
+                prev_area = area
+            else:
+                print(f"  WARNING: chemostat {chem_num} did not reach the range after "
+                      f"{MAX_ROUNDS} rounds - moving on.")
+
+        print("=== Fix droplet sizes: final areas ===")
+        for chem_num in sorted(areas):
+            print(self._init_area_line(chem_num, areas[chem_num], desired_area, TOL))
+        return areas
+
+    def _measure_chemostat_droplet_area(self, chem_num, positions_table, filt, exp, save_tag=None):
+        """
+        Move to the stage position for chemostat chem_num, snap an FL
+        image with the given filter/exposure, and return its droplet area
+        in px via segment_droplet_fl - the same segmentation used for FL
+        timelapse area-check imaging. Chemostat N sits at positions_table[N-1],
+        the same mapping drive_droplet's caller already relies on.
+
+        If save_tag is given, also saves the segmentation overlay (mask +
+        contour) as "Mask_chemostat<chem_num>_<save_tag>.png" in the
+        current directory, e.g. save_tag="initial" or "cycle2".
+        """
+        px, py, pz = positions_table[chem_num - 1]
+        self.mmc.setTimeoutMs(30000)
+        self.mmc.setXYPosition(px, py)
+        self.mmc.waitForDevice(self.mmc.getXYStageDevice())
+        self.mmc.setPosition(pz)
+        self.mmc.waitForDevice(self.mmc.getFocusDevice())
+        self.mmc.setTimeoutMs(5000)
+        time.sleep(0.3)
+        raw_fl = self.snap_EPI_image(filt, exp)
+        mask, area, overlay = segment_droplet_fl(raw_fl)
+        self._last_chem_measurement[chem_num] = (raw_fl, mask, filt, exp)
+        if save_tag is not None:
+            mask_fname = f"Mask_chemostat{chem_num}_{save_tag}.png"
+            cv2.imwrite(os.path.join(".", mask_fname), overlay)
+            # The raw frame the mask was made from, so a bad measurement
+            # can be diagnosed afterwards.
+            raw_fname = f"Raw_chemostat{chem_num}_{save_tag}.tiff"
+            tiff.imwrite(os.path.join(".", raw_fname), raw_fl)
+        return area
+
     def PWM_droplet(self, input_1=12, input_2=13):
         self.PWM_thread = DropletWorker(
             "PWM", input_1, input_2,
@@ -2447,7 +2871,11 @@ class MicroscopeControlGUI(QMainWindow):
         """
         pos_num  = idx + 1
         init_key = f"Fluo_Pos{pos_num}_initial"
-        key = init_key if tick_number == 1 else f"Fluo_Pos{pos_num}_{time_tag_min:.0f}min"
+        # Tick 1 is the initial value unless it was already seeded from the
+        # final Fix Droplet Sizes image - then it's an ordinary measurement.
+        seeded = init_key in fluo_values
+        key = (init_key if tick_number == 1 and not seeded
+               else f"Fluo_Pos{pos_num}_{time_tag_min:.0f}min")
 
         factor = upconc_factors.get(idx)   # None for unaddressed positions
         result = droplet_fluorescence(raw_fl, mask)
@@ -2459,7 +2887,7 @@ class MicroscopeControlGUI(QMainWindow):
 
         ratio = None
         initial = fluo_values.get(init_key)
-        if tick_number > 1 and initial is not None:
+        if key != init_key and initial is not None:
             if initial > 0:
                 ratio = fluo / initial
             else:
@@ -2640,6 +3068,23 @@ class MicroscopeControlGUI(QMainWindow):
                                 + "\n".join(unset))
             return
 
+        # Initial areas from the last Fix Droplet Sizes run (chemostat N =
+        # position N); positions without one are measured on the first tick.
+        seed_initial_areas = {c - 1: a for c, a in self._fix_final_areas.items()
+                              if a > 0 and c - 1 < len(self.positions)}
+        # Initial fluorescence from the same Fix images - only comparable if
+        # they were taken with the experiment's first exposure row.
+        seed_initial_fluo = {}
+        for c, (fluo, med_in, med_out, filt, exp) in self._fix_final_fluo.items():
+            if c - 1 >= len(self.positions):
+                continue
+            if [filt, exp] != list(self.selected_exposures[0]):
+                print(f"Pos {c}: Fix Droplet Sizes fluorescence was taken with filt {filt} "
+                      f"{exp}ms, not the first exposure row - measuring initial "
+                      f"fluorescence on the first cycle instead.")
+                continue
+            seed_initial_fluo[c - 1] = (fluo, med_in, med_out)
+
         base      = self.directory_input.text().strip() or "."
         purge_dur = float(self.purge_duration_Input.text())
         flow_dur  = float(self.flow_duration_Input.text())
@@ -2652,13 +3097,13 @@ class MicroscopeControlGUI(QMainWindow):
             # for why (the user can still click Save/Clear Position or Add
             # Step while this worker thread is running).
             list(self.positions), list(self.selected_exposures),
-            upconc_factors, mode_inlets, addressed,
+            upconc_factors, mode_inlets, addressed, seed_initial_areas, seed_initial_fluo,
         )
 
     def _run_fl_experiment_body(self, interval_min, total_min, base,
                                  purge_dur, flow_dur, drive_dur,
                                  positions, selected_exposures,
-                                 upconc_factors, mode_inlets, addressed):
+                                 upconc_factors, mode_inlets, addressed, seed_initial_areas, seed_initial_fluo):
         """
         FL-segmentation timelapse — no pre-annotation required.
         Runs on a background ExperimentWorker thread (see _start_fl_experiment).
@@ -2670,7 +3115,9 @@ class MicroscopeControlGUI(QMainWindow):
              with every other entry. All images are saved as raw uint16 TIFFs.
           2. segment_droplet_fl() segments the droplet and measures its area.
              The segmentation overlay is saved alongside the TIFF for inspection.
-          3. Initial area is recorded on the very first tick.
+          3. Initial area: the final area from the last Fix Droplet Sizes
+             run (seed_initial_areas, chemostat N = position N) where
+             available, otherwise the area measured on the very first tick.
           4. Droplet fluorescence (median inside mask − median outside) is
              recorded as Fluo_Pos#_initial on tick 1 and Fluo_Pos#_##min
              afterwards, logged to <base>/fluorescence_upconcentration.csv.
@@ -2703,7 +3150,7 @@ class MicroscopeControlGUI(QMainWindow):
             self._run_fl_experiment_body_inner(
                 interval_min, total_min, base, purge_dur, flow_dur, drive_dur,
                 positions, selected_exposures,
-                upconc_factors, mode_inlets, addressed)
+                upconc_factors, mode_inlets, addressed, seed_initial_areas, seed_initial_fluo)
         except Exception:
             # Stop (ExperimentStopped) or a real failure mid-run: reset to a
             # known-safe state before propagating. Normal completion does
@@ -2715,12 +3162,14 @@ class MicroscopeControlGUI(QMainWindow):
     def _run_fl_experiment_body_inner(self, interval_min, total_min, base,
                                        purge_dur, flow_dur, drive_dur,
                                        positions, selected_exposures,
-                                       upconc_factors, mode_inlets, addressed):
+                                       upconc_factors, mode_inlets, addressed, seed_initial_areas, seed_initial_fluo):
         interval_sec = interval_min * 60
         total_sec    = total_min    * 60
 
         # Per-position state — all local
-        initial_areas  = {}   # {idx: int px}  – recorded on tick 1
+        # {idx: int px} - from the last Fix Droplet Sizes run where available,
+        # otherwise recorded on tick 1
+        initial_areas  = dict(seed_initial_areas)
         pos_loop_count = {}   # {idx: int}      – completed loops (0 → Loop 1)
         # Fluorescence values keyed "Fluo_Pos#_initial" / "Fluo_Pos#_##min"
         fluo_values    = {}
@@ -2741,6 +3190,18 @@ class MicroscopeControlGUI(QMainWindow):
                     "upconc_factor", "mode",
                     "area_fraction", "real_upconc",
                 ])
+        # Initial fluorescence from the final Fix Droplet Sizes images
+        with open(fluo_csv, "a", newline="") as f:
+            for idx, (fluo, med_in, med_out) in sorted(seed_initial_fluo.items()):
+                fluo_values[f"Fluo_Pos{idx + 1}_initial"] = fluo
+                csv.writer(f).writerow([
+                    f"Fluo_Pos{idx + 1}_initial", idx + 1, "fix", f"{med_in:.2f}",
+                    f"{med_out:.2f}", f"{fluo:.2f}", "",
+                    "" if upconc_factors.get(idx) is None else upconc_factors[idx],
+                    pos_mode.get(idx, "not addressed"), "", "",
+                ])
+                print(f"  Pos {idx + 1}: initial fluorescence = {fluo:.1f} "
+                      f"(from Fix Droplet Sizes)")
 
         # Initialise valves
         init_states = [
@@ -2842,8 +3303,12 @@ class MicroscopeControlGUI(QMainWindow):
 
                 # Record initial area on the very first tick
                 if tick_number == 1:
-                    initial_areas[idx] = seg_area
-                    print(f"  Pos {pos_num}: initial area recorded = {seg_area} px")
+                    if idx in initial_areas:
+                        print(f"  Pos {pos_num}: initial area = {initial_areas[idx]} px "
+                              f"(from Fix Droplet Sizes; measured now: {seg_area} px)")
+                    else:
+                        initial_areas[idx] = seg_area
+                        print(f"  Pos {pos_num}: initial area recorded = {seg_area} px")
                 else:
                     ratio = seg_area / initial if initial > 0 else 1.0
                     # Synthesis waits for a deeper shrink (0.4x) than the
@@ -3015,7 +3480,8 @@ class MicroscopeControlGUI(QMainWindow):
         """
         self.stop_experiment_button.setEnabled(not enabled)
         for widget in (
-            self.fl_start_button, self.live_Button, self.record_button,
+            self.fl_start_button, self.initialize_chemostats_button,
+            self.fix_droplet_sizes_button, self.live_Button, self.record_button,
             self.quick_fl_snap_button,
             self.save_Position_button, self.replacePositionButton,
             self.clearButton, self.GoToPositionButton, self.Save_Exposures_button,
