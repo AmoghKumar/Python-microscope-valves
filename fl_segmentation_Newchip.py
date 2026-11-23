@@ -1424,9 +1424,7 @@ class MicroscopeControlGUI(QMainWindow):
         self.current_protocol_table_step = 0
         self._experiment_stop_requested = False
         self._exp_worker = None
-        self.shrink_auto_mode = False   # Manual is the default mode
         self.interval_per_chemostat = {}      # {chem_num: 1|2|3}, Timelapse Experiment only
-        self.shrink_mode_per_chemostat = {}   # {chem_num: bool} - overrides shrink_auto_mode per chemostat
         # Viewer brightness/contrast (display only - never touches saved data,
         # and never touches the live video, only snapped images).
         # _last_raw is the unmodified last snapped frame. While _bc_manual is
@@ -1861,7 +1859,7 @@ class MicroscopeControlGUI(QMainWindow):
         # -- Droplet parameters
         dp_grid = QGridLayout()
         dp_grid.setSpacing(4)
-        self.Shrink_duration_Input = QLineEdit("5")
+        self.Shrink_duration_Input = QLineEdit("3")
         self.purge_duration_Input  = QLineEdit("1")
         self.flow_duration_Input   = QLineEdit("0.1")
         self.drive_duration_Input  = QLineEdit("5")
@@ -1873,20 +1871,14 @@ class MicroscopeControlGUI(QMainWindow):
         self.inlet2_Input.setRange(1, 9)
         self.inlet2_Input.setValue(2)
 
-        # -- Shrink duration + Auto/Manual mode + target ratio, all one row
+        # -- Shrink duration + target ratio, one row (shrinking is always auto)
         shrink_lbl = QLabel("Shrink duration (s):"); shrink_lbl.setStyleSheet("color:#aaa;")
-        self.shrink_mode_button = QPushButton("Mode: Manual")
-        self.shrink_mode_button.setCheckable(True)
-        self.shrink_mode_button.setChecked(False)   # Manual is the default mode
-        self.shrink_mode_button.setStyleSheet(BTN_RED)
-        self.shrink_mode_button.clicked.connect(self._on_toggle_shrink_mode)
         target_lbl = QLabel("Shrink target (x initial):"); target_lbl.setStyleSheet("color:#aaa;")
-        self.shrink_target_ratio_Input = QLineEdit("0.85")
+        self.shrink_target_ratio_Input = QLineEdit("0.8")
         shrink_row = QHBoxLayout()
         shrink_row.setSpacing(6)
         shrink_row.addWidget(shrink_lbl)
         shrink_row.addWidget(self.Shrink_duration_Input)
-        shrink_row.addWidget(self.shrink_mode_button)
         shrink_row.addWidget(target_lbl)
         shrink_row.addWidget(self.shrink_target_ratio_Input)
         dp_grid.addLayout(shrink_row, 0, 0, 1, 2)
@@ -1956,7 +1948,7 @@ class MicroscopeControlGUI(QMainWindow):
         init_chem_row.addStretch()
         init_layout.addLayout(init_chem_row)
 
-        self.init_desired_area_Input = QLineEdit("52000")
+        self.init_desired_area_Input = QLineEdit("52500")
         area_lbl = QLabel("Desired droplet area (px):"); area_lbl.setStyleSheet("color:#aaa;")
         self.initialize_chemostats_button = QPushButton("Initialize Chemostats")
         self.initialize_chemostats_button.setStyleSheet(BTN_GREEN)
@@ -2186,22 +2178,10 @@ class MicroscopeControlGUI(QMainWindow):
         interval_wrapper.addLayout(self.interval_per_chem_layout)
         left.addWidget(group("Per-Chemostat Cycle Interval", interval_wrapper))
 
-        # -- Per-chemostat shrink mode - rebuilt automatically to match
-        #    whichever chemostats are addressed in Chemostat_protocol_steps
-        #    (see _refresh_shrink_mode_panel, called from add_loading_step /
-        #    clear_last_step / clear_all_steps).
-        shrink_mode_wrapper = QVBoxLayout()
-        shrink_mode_info = QLabel(
-            "Auto/Manual shrink mode per chemostat, based on which ones are "
-            "used in the protocol table above:")
-        shrink_mode_info.setStyleSheet("color:#aaa; font-size:11px;")
-        shrink_mode_info.setWordWrap(True)
-        shrink_mode_wrapper.addWidget(shrink_mode_info)
-        self.shrink_per_chem_layout = QHBoxLayout()
-        self.shrink_per_chem_layout.setSpacing(6)
-        shrink_mode_wrapper.addLayout(self.shrink_per_chem_layout)
-        left.addWidget(group("Per-Chemostat Shrink Mode", shrink_mode_wrapper))
-        self._refresh_shrink_mode_panel()
+        # The interval panel above is rebuilt to match whichever chemostats
+        # are addressed in Chemostat_protocol_steps (see _refresh_interval_panel,
+        # called from add_loading_step / clear_last_step / clear_all_steps).
+        self._refresh_interval_panel()
 
         left.addStretch()
 
@@ -2900,14 +2880,15 @@ class MicroscopeControlGUI(QMainWindow):
            position and report it against the desired area.
         2. Shrink: for each ticked chemostat that is too large, one at a
            time (highest number first), shrink and re-measure until its area
-           is within +/-5% of the desired area. Ones already in range are
-           left alone; ones too small can't be grown back.
+           is within +/-1% of the desired area (at most 5 rounds each,
+           each shrink at most 5x the entered shrink duration). Ones already
+           in range are left alone; ones too small can't be grown back.
         Saves Mask_/Raw_chemostat#_fix_before and ..._fix_round# files.
         """
-        TOL = 0.05
-        MAX_ROUNDS = 8
+        TOL = 0.01
+        MAX_ROUNDS = 5
         MIN_SHRINK_DURATION = 0.5
-        MAX_SHRINK_DURATION = 1.5 * shrink_duration
+        MAX_SHRINK_DURATION = 5.0 * shrink_duration
         lo, hi = desired_area * (1 - TOL), desired_area * (1 + TOL)
         chemostats = sorted(chemostats)
 
@@ -3052,7 +3033,7 @@ class MicroscopeControlGUI(QMainWindow):
             lyt.addWidget(cb)
             self.Chemostat_protocol_table.setCellWidget(2 + i, col, w)
         self.current_protocol_table_step += 1
-        self._refresh_shrink_mode_panel()
+        self._refresh_interval_panel()
 
     def clear_all_steps(self):
         self.Chemostat_protocol_steps = []
@@ -3063,7 +3044,7 @@ class MicroscopeControlGUI(QMainWindow):
                     self.Chemostat_protocol_table.setItem(r, c, QTableWidgetItem(""))
                 else:
                     self.Chemostat_protocol_table.setCellWidget(r, c, self.create_centered_checkbox())
-        self._refresh_shrink_mode_panel()
+        self._refresh_interval_panel()
 
     def clear_last_step(self):
         if not self.Chemostat_protocol_steps:
@@ -3079,7 +3060,7 @@ class MicroscopeControlGUI(QMainWindow):
                 if frame:
                     cb = frame.layout().itemAt(0).widget()
                     if cb: cb.setChecked(False)
-        self._refresh_shrink_mode_panel()
+        self._refresh_interval_panel()
 
     def export_to_csv(self):
         if not self.Chemostat_protocol_steps:
@@ -3128,59 +3109,6 @@ class MicroscopeControlGUI(QMainWindow):
         if self._experiment_stop_requested:
             raise ExperimentStopped()
 
-    def _on_toggle_shrink_mode(self):
-        """Shrink mode toggle button - Manual (default) uses a single fixed
-        Shrink_duration pass; Auto adaptively re-measures droplet area and
-        keeps shrinking until it's below the target ratio of its initial
-        area (see _run_auto_shrink)."""
-        self.shrink_auto_mode = self.shrink_mode_button.isChecked()
-        if self.shrink_auto_mode:
-            self.shrink_mode_button.setText("Mode: Auto")
-            self.shrink_mode_button.setStyleSheet(BTN_GREEN)
-        else:
-            self.shrink_mode_button.setText("Mode: Manual")
-            self.shrink_mode_button.setStyleSheet(BTN_RED)
-
-    def _refresh_shrink_mode_panel(self):
-        """
-        Rebuild the per-chemostat Auto/Manual row to match whichever
-        chemostats are currently addressed anywhere in
-        Chemostat_protocol_steps. Called from add_loading_step /
-        clear_last_step / clear_all_steps, so it always reflects the
-        current protocol table. Existing per-chemostat choices
-        (self.shrink_mode_per_chemostat) are preserved across refreshes -
-        a chemostat that's newly addressed defaults to whatever the
-        global Mode button is currently set to.
-        """
-        self._refresh_interval_panel()
-        while self.shrink_per_chem_layout.count():
-            item = self.shrink_per_chem_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-
-        used_chemostats = set()
-        for step in self.Chemostat_protocol_steps:
-            for rn, active in enumerate(step["rings"]):
-                if active:
-                    used_chemostats.add(rn + 1)
-
-        if not used_chemostats:
-            placeholder = QLabel("No chemostats used in the protocol table yet.")
-            placeholder.setStyleSheet("color:#888; font-style:italic;")
-            self.shrink_per_chem_layout.addWidget(placeholder)
-            return
-
-        for chem_num in sorted(used_chemostats):
-            is_auto = self.shrink_mode_per_chemostat.get(chem_num, self.shrink_auto_mode)
-            btn = QPushButton()
-            btn.setCheckable(True)
-            btn.setChecked(is_auto)
-            self._style_chemostat_shrink_mode_button(btn, chem_num, is_auto)
-            btn.clicked.connect(
-                lambda checked, c=chem_num, b=btn: self._on_toggle_chemostat_shrink_mode(c, b, checked))
-            self.shrink_per_chem_layout.addWidget(btn)
-
     def _refresh_interval_panel(self):
         """Rebuild the per-chemostat interval selectors (1/2/3) to match the
         chemostats used in Chemostat_protocol_steps, keeping earlier choices."""
@@ -3210,14 +3138,6 @@ class MicroscopeControlGUI(QMainWindow):
             combo.currentIndexChanged.connect(
                 lambda idx, c=chem_num: self.interval_per_chemostat.__setitem__(c, idx + 1))
             self.interval_per_chem_layout.addWidget(combo)
-
-    def _style_chemostat_shrink_mode_button(self, btn, chem_num, is_auto):
-        btn.setText(f"Chem {chem_num}: {'Auto' if is_auto else 'Manual'}")
-        btn.setStyleSheet(BTN_GREEN if is_auto else BTN_RED)
-
-    def _on_toggle_chemostat_shrink_mode(self, chem_num, btn, checked):
-        self.shrink_mode_per_chemostat[chem_num] = checked
-        self._style_chemostat_shrink_mode_button(btn, chem_num, checked)
 
     def _measure_chemostat_droplet_area(self, chem_num, positions_table, filt, exp, save_tag=None):
         """
@@ -3297,9 +3217,9 @@ class MicroscopeControlGUI(QMainWindow):
         """
         if shrink_calibrated_durations is None:
             shrink_calibrated_durations = {}
-        MAX_ROUNDS = 4
+        MAX_ROUNDS = 5
         MIN_SHRINK_DURATION = 0.5
-        MAX_SHRINK_DURATION = 1.5 * shrink_duration  # guards against runaway extrapolation from a tiny/noisy drop
+        MAX_SHRINK_DURATION = 5.0 * shrink_duration  # guards against runaway extrapolation from a tiny/noisy drop
         SUSPECT_RATIO = 1.5
         TARGET_TOL = 0.01   # a ratio within target +/- 0.01 counts as on target
 
@@ -4543,7 +4463,7 @@ class MicroscopeControlGUI(QMainWindow):
                            flow_duration, drive_duration,
                            shrink_initial_areas, shrink_calibrated_durations):
         """
-        Buffer flush, shrink (manual/auto per chemostat), then every protocol
+        Buffer flush, auto shrink, then every protocol
         step (purge, generate droplet, drive) for just the given chemostats.
         Steps that address none of them are skipped entirely.
         """
@@ -4569,30 +4489,12 @@ class MicroscopeControlGUI(QMainWindow):
                 if active:
                     used_chemostats.add(rn + 1)
 
-        # Each chemostat's mode comes from shrink_mode_per_chemostat
-        # (set via the Per-Chemostat Shrink Mode panel), falling
-        # back to the global Mode button for any chemostat that
-        # hasn't been individually set. Manual chemostats run
-        # first as a single fixed-duration pass (highest number
-        # first); auto ones then go through the adaptive loop.
-        auto_chemostats = {
-            c for c in used_chemostats
-            if self.shrink_mode_per_chemostat.get(c, self.shrink_auto_mode)
-        }
-        manual_chemostats = used_chemostats - auto_chemostats
-
-        for chem_num in sorted(manual_chemostats, reverse=True):
-            if self._experiment_stop_requested:
-                raise ExperimentStopped()
-            sw = DropletWorker(
-                "shrink", chemostat_number=chem_num,
-                shrink_duration=shrink_duration,
-            )
-            sw.start(); sw.wait()
-
-        if auto_chemostats:
+        # Every chemostat in the protocol table is shrunk adaptively
+        # (_run_auto_shrink): shrink, re-measure, repeat until it reaches the
+        # target ratio of its initial area.
+        if used_chemostats:
             self._run_auto_shrink(
-                auto_chemostats, positions_table, selected_exposures,
+                used_chemostats, positions_table, selected_exposures,
                 shrink_duration, shrink_initial_areas,
                 shrink_calibrated_durations, loop_num=loop_num)
 
@@ -4677,6 +4579,13 @@ class MicroscopeControlGUI(QMainWindow):
             # intervals fit into it.
             num_loops = max(1, round(total_duration / time_interval)) if time_interval > 0 else 1
             snapshot_steps = list(self.Chemostat_protocol_steps)
+            if snapshot_steps and not self.selected_exposures:
+                QMessageBox.warning(
+                    self, "Start experiment",
+                    "Every chemostat is auto-shrunk, which measures droplet area with "
+                    "the first row of the exposure table - set a filter/exposure and "
+                    "click Save Values first.")
+                return
             chemostat_intervals = {}
             for step in snapshot_steps:
                 for rn, active in enumerate(step["rings"]):
